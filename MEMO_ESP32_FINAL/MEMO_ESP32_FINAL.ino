@@ -37,6 +37,7 @@ extern const esp_wn_iface_t esp_sr_wakenet9_quantized;
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include "myanmar_bitmaps.h"
 
 #include <ArduinoWebsockets.h>
 // ArduinoWebsockets (Gil Maimon, v0.5.4) waits only _CONNECTION_TIMEOUT = 1000 ms for the
@@ -1689,7 +1690,7 @@ class WakeWordEngine {
 private:
     WakeNetStatus status = WakeNetStatus::UNINITIALIZED;
     bool modelLoaded = false;
-    bool activeListening = false;
+    std::atomic<bool> activeListening{false};
     const char* activeModelName = WAKE_WORD_MODEL_NAME;
     const char* activeWakeWord = WAKE_WORD_PHRASE;
 
@@ -1766,14 +1767,16 @@ public:
     }
 
     void setListening(bool listening) {
-        activeListening = listening;
+        activeListening.store(listening, std::memory_order_release);
         accumCount = 0;
         if (listening) {
-            Serial.println("[WakeWord] State: IDLE_LISTEN");
+            Serial.println("[WakeWord] State: IDLE_LISTEN (re-armed)");
+        } else {
+            Serial.println("[WakeWord] State: DISARMED");
         }
     }
 
-    bool isListening() const { return activeListening; }
+    bool isListening() const { return activeListening.load(std::memory_order_acquire); }
     bool isModelLoaded() const { return modelLoaded; }
     bool hasPreRoll() const { return validPreRoll; }
     WakeNetStatus getStatus() const { return status; }
@@ -1793,7 +1796,7 @@ public:
     }
 
     bool processPcmChunk(const int16_t* pcmSamples, size_t sampleCount) {
-        if (!activeListening || !modelLoaded || !modelData || !wakenetIface || !pcmSamples || sampleCount == 0) {
+        if (!activeListening.load(std::memory_order_acquire) || !modelLoaded || !modelData || !wakenetIface || !pcmSamples || sampleCount == 0) {
             return false;
         }
 
@@ -1822,7 +1825,7 @@ public:
                     lastDetectionTime = now;
                     totalDetections++;
                     validPreRoll = true;
-                    activeListening = false;
+                    activeListening.store(false, std::memory_order_release);
                     status = WakeNetStatus::WAKE_DETECTED;
 
                     Serial.printf("[WakeWord] DETECTED: \"%s\"! Launching Gemini Voice Session...\n", activeWakeWord);
@@ -2073,6 +2076,16 @@ private:
     unsigned long lastStatusBarDraw = 0;
     String lastRfidScanned = "";
 
+    struct RfidCardView {
+        bool active = false;
+        String uid = "";
+        bool found = false;
+        String itemKey = "";
+        String nameEn = "";
+        String nameMm = "";
+        unsigned long displayStartTime = 0;
+    } rfidCardView;
+
 public:
     static UIManager& getInstance() {
         static UIManager instance;
@@ -2088,6 +2101,129 @@ public:
 
     void setLastRfid(const String& uid) {
         lastRfidScanned = uid;
+    }
+
+    void showRfidResult(const String& uid, bool found, const String& itemKey, const String& nameEn, const String& nameMm) {
+        rfidCardView.active = true;
+        rfidCardView.uid = uid;
+        rfidCardView.found = found;
+        rfidCardView.itemKey = itemKey;
+        rfidCardView.nameEn = nameEn;
+        rfidCardView.nameMm = nameMm;
+        rfidCardView.displayStartTime = millis();
+        lastRfidScanned = uid;
+        setScreen(ActiveScreen::SCREEN_RFID);
+    }
+
+    void drawVectorGraphic(const String& item, int cx, int cy) {
+        if (item == "apple") {
+            // Apple body: two overlapping red circles + rounded core
+            tft.fillCircle(cx - 10, cy + 2, 20, tft.color565(230, 40, 50));
+            tft.fillCircle(cx + 10, cy + 2, 20, tft.color565(230, 40, 50));
+            tft.fillRoundRect(cx - 18, cy - 12, 36, 30, 10, tft.color565(230, 40, 50));
+            tft.fillCircle(cx, cy - 14, 5, tft.color565(25, 38, 65));
+            tft.fillCircle(cx, cy + 22, 4, tft.color565(25, 38, 65));
+            // Stem
+            tft.fillRoundRect(cx - 2, cy - 28, 4, 15, 2, tft.color565(120, 70, 30));
+            // Green leaf
+            tft.fillCircle(cx + 9, cy - 22, 6, tft.color565(60, 190, 70));
+            tft.fillTriangle(cx + 4, cy - 22, cx + 16, cy - 26, cx + 14, cy - 18, tft.color565(60, 190, 70));
+            // Shine highlight
+            tft.drawCircle(cx - 10, cy - 2, 12, TFT_WHITE);
+        } else if (item == "elephant") {
+            uint16_t cGrey = tft.color565(140, 175, 210);
+            uint16_t cPink = tft.color565(255, 185, 205);
+            // Big ears
+            tft.fillCircle(cx - 22, cy - 4, 16, cGrey);
+            tft.fillCircle(cx - 22, cy - 4, 10, cPink);
+            tft.fillCircle(cx + 22, cy - 4, 16, cGrey);
+            tft.fillCircle(cx + 22, cy - 4, 10, cPink);
+            // Head
+            tft.fillCircle(cx, cy, 22, cGrey);
+            // Trunk
+            tft.fillRoundRect(cx - 6, cy + 6, 12, 20, 6, cGrey);
+            tft.fillCircle(cx + 5, cy + 24, 6, cGrey);
+            // Tusks
+            tft.fillTriangle(cx - 8, cy + 12, cx - 14, cy + 20, cx - 6, cy + 16, TFT_WHITE);
+            tft.fillTriangle(cx + 8, cy + 12, cx + 14, cy + 20, cx + 6, cy + 16, TFT_WHITE);
+            // Eyes
+            tft.fillCircle(cx - 9, cy - 4, 3, TFT_BLACK);
+            tft.fillCircle(cx - 8, cy - 5, 1, TFT_WHITE);
+            tft.fillCircle(cx + 9, cy - 4, 3, TFT_BLACK);
+            tft.fillCircle(cx + 10, cy - 5, 1, TFT_WHITE);
+        } else if (item == "cat") {
+            uint16_t cCat = tft.color565(255, 165, 50);
+            uint16_t cEarPink = tft.color565(255, 185, 195);
+            // Ears
+            tft.fillTriangle(cx - 22, cy - 10, cx - 16, cy - 32, cx - 6, cy - 16, cCat);
+            tft.fillTriangle(cx - 20, cy - 12, cx - 16, cy - 27, cx - 8, cy - 16, cEarPink);
+            tft.fillTriangle(cx + 22, cy - 10, cx + 16, cy - 32, cx + 6, cy - 16, cCat);
+            tft.fillTriangle(cx + 20, cy - 12, cx + 16, cy - 27, cx + 8, cy - 16, cEarPink);
+            // Head
+            tft.fillCircle(cx, cy, 22, cCat);
+            // Eyes
+            tft.fillCircle(cx - 9, cy - 3, 4, TFT_BLACK);
+            tft.fillCircle(cx - 8, cy - 4, 1, TFT_WHITE);
+            tft.fillCircle(cx + 9, cy - 3, 4, TFT_BLACK);
+            tft.fillCircle(cx + 10, cy - 4, 1, TFT_WHITE);
+            // Nose & whiskers
+            tft.fillTriangle(cx - 3, cy + 4, cx + 3, cy + 4, cx, cy + 7, cEarPink);
+            tft.drawFastHLine(cx - 24, cy + 4, 12, TFT_BLACK);
+            tft.drawFastHLine(cx - 24, cy + 9, 12, TFT_BLACK);
+            tft.drawFastHLine(cx + 12, cy + 4, 12, TFT_BLACK);
+            tft.drawFastHLine(cx + 12, cy + 9, 12, TFT_BLACK);
+        } else if (item == "dog") {
+            uint16_t cDog = tft.color565(225, 160, 90);
+            uint16_t cEar = tft.color565(160, 95, 45);
+            uint16_t cMuzzle = tft.color565(250, 240, 225);
+            // Floppy ears
+            tft.fillRoundRect(cx - 26, cy - 16, 12, 30, 6, cEar);
+            tft.fillRoundRect(cx + 14, cy - 16, 12, 30, 6, cEar);
+            // Head
+            tft.fillCircle(cx, cy, 22, cDog);
+            // Muzzle
+            tft.fillCircle(cx, cy + 8, 12, cMuzzle);
+            // Nose & tongue
+            tft.fillRoundRect(cx - 5, cy + 4, 10, 6, 3, TFT_BLACK);
+            tft.fillRoundRect(cx - 3, cy + 14, 6, 8, 3, tft.color565(255, 120, 140));
+            // Eyes
+            tft.fillCircle(cx - 9, cy - 4, 4, TFT_BLACK);
+            tft.fillCircle(cx - 8, cy - 5, 1, TFT_WHITE);
+            tft.fillCircle(cx + 9, cy - 4, 4, TFT_BLACK);
+            tft.fillCircle(cx + 10, cy - 5, 1, TFT_WHITE);
+        } else if (item == "banana") {
+            uint16_t cYellow = tft.color565(255, 225, 30);
+            uint16_t cDarkYellow = tft.color565(220, 180, 20);
+            uint16_t cStem = tft.color565(110, 75, 25);
+            // Banana crescent
+            tft.fillCircle(cx - 6, cy + 4, 22, cYellow);
+            tft.fillCircle(cx - 16, cy - 6, 18, tft.color565(25, 38, 65));
+            tft.fillRoundRect(cx - 20, cy - 22, 10, 16, 4, cStem);
+            tft.fillRoundRect(cx + 14, cy + 16, 8, 8, 3, cDarkYellow);
+            tft.drawFastHLine(cx - 4, cy + 8, 16, cDarkYellow);
+        } else {
+            // Mystery card / Unknown
+            tft.fillRoundRect(cx - 24, cy - 24, 48, 48, 8, tft.color565(60, 85, 125));
+            tft.drawRoundRect(cx - 24, cy - 24, 48, 48, 8, tft.color565(255, 215, 64));
+            tft.setTextDatum(textdatum_t::middle_center);
+            tft.setTextSize(3);
+            tft.setTextColor(tft.color565(255, 215, 64), tft.color565(60, 85, 125));
+            tft.drawString("?", cx, cy);
+        }
+    }
+
+    void drawMyanmarBitmap(const String& item, int x, int y, uint16_t color, uint16_t bg) {
+        if (item == "apple") {
+            tft.drawBitmap(x, y, MM_BITMAP_apple, MM_BITMAP_apple_W, MM_BITMAP_apple_H, color, bg);
+        } else if (item == "elephant") {
+            tft.drawBitmap(x, y, MM_BITMAP_elephant, MM_BITMAP_elephant_W, MM_BITMAP_elephant_H, color, bg);
+        } else if (item == "cat") {
+            tft.drawBitmap(x, y, MM_BITMAP_cat, MM_BITMAP_cat_W, MM_BITMAP_cat_H, color, bg);
+        } else if (item == "dog") {
+            tft.drawBitmap(x, y, MM_BITMAP_dog, MM_BITMAP_dog_W, MM_BITMAP_dog_H, color, bg);
+        } else if (item == "banana") {
+            tft.drawBitmap(x, y, MM_BITMAP_banana, MM_BITMAP_banana_W, MM_BITMAP_banana_H, color, bg);
+        }
     }
 
     void drawStatusBar(bool wifiOk, int rssi, bool wsOk, uint8_t vol) {
@@ -2321,20 +2457,93 @@ public:
     }
 
     void renderScreenRfid() {
-        tft.fillRect(0, 24, 320, 216, tft.color565(18, 22, 42));
-        tft.setTextColor(TFT_WHITE, tft.color565(18, 22, 42));
-        tft.setTextDatum(textdatum_t::top_center);
-        tft.drawString("PN532 RFID READER STATUS", 160, 30);
+        if (rfidCardView.active) {
+            // Child-Friendly RFID Learning Card Display (Feature E)
+            const uint16_t cCardBg = tft.color565(25, 38, 65);
+            tft.fillRect(0, 24, 320, 216, tft.color565(14, 22, 38));
+            tft.fillRoundRect(10, 28, 300, 206, 12, cCardBg);
+            tft.drawRoundRect(10, 28, 300, 206, 12, tft.color565(70, 120, 190));
 
-        tft.setTextDatum(textdatum_t::top_left);
-        tft.setCursor(20, 60);
-        tft.print("Interface: UART1 (GPIO 1/2) 115200");
-        tft.setCursor(20, 85);
-        tft.printf("Last Card UID: %s\n", lastRfidScanned.length() > 0 ? lastRfidScanned.c_str() : "[NO CARD DETECTED]");
-        tft.setCursor(20, 110);
-        tft.print("Mode: MIFARE Classic Educational");
+            if (rfidCardView.found) {
+                // Header Banner
+                tft.setTextDatum(textdatum_t::top_center);
+                tft.setTextSize(1);
+                tft.setTextColor(tft.color565(0, 229, 255), cCardBg);
+                tft.drawString("MEMO RFID LEARNING CARD", 160, 36);
 
-        drawButton(80, 175, 160, 38, "<- BACK TO MENU", tft.color565(40, 50, 70));
+                // Cute Vector Graphic (Center: x=75, y=125)
+                drawVectorGraphic(rfidCardView.itemKey, 75, 125);
+
+                // English Title
+                tft.setTextDatum(textdatum_t::top_left);
+                tft.setTextSize(2);
+                tft.setTextColor(TFT_WHITE, cCardBg);
+                tft.drawString(rfidCardView.nameEn.c_str(), 145, 62);
+
+                // Crisp Myanmar Bitmap Title
+                drawMyanmarBitmap(rfidCardView.itemKey, 145, 102, tft.color565(255, 215, 64), cCardBg);
+
+                // Scanned UID Badge
+                tft.fillRoundRect(145, 142, 155, 24, 4, tft.color565(16, 26, 45));
+                tft.drawRoundRect(145, 142, 155, 24, 4, tft.color565(55, 85, 130));
+                tft.setTextSize(1);
+                tft.setTextColor(tft.color565(160, 195, 235), tft.color565(16, 26, 45));
+                tft.drawString(("UID: " + rfidCardView.uid).c_str(), 152, 148);
+
+                // Footer auto-close hint
+                tft.setCursor(145, 182);
+                tft.setTextColor(tft.color565(110, 140, 175), cCardBg);
+                tft.print("Tap to close (6s)");
+            } else {
+                // Unregistered Card View
+                tft.setTextDatum(textdatum_t::top_center);
+                tft.setTextSize(1);
+                tft.setTextColor(tft.color565(255, 171, 0), cCardBg);
+                tft.drawString("NEW RFID CARD DETECTED", 160, 36);
+
+                // Unknown Card Graphic
+                drawVectorGraphic("unknown", 75, 125);
+
+                // Registration details
+                tft.setTextDatum(textdatum_t::top_left);
+                tft.setTextSize(2);
+                tft.setTextColor(tft.color565(255, 180, 50), cCardBg);
+                tft.drawString("UNREGISTERED", 145, 62);
+
+                tft.setTextSize(1);
+                tft.setTextColor(TFT_WHITE, cCardBg);
+                tft.drawString("Register in MongoDB:", 145, 102);
+
+                tft.fillRoundRect(145, 125, 155, 24, 4, tft.color565(16, 26, 45));
+                tft.drawRoundRect(145, 125, 155, 24, 4, tft.color565(180, 120, 40));
+                tft.setTextColor(tft.color565(255, 220, 100), tft.color565(16, 26, 45));
+                tft.drawString(("UID: " + rfidCardView.uid).c_str(), 152, 131);
+
+                tft.setCursor(145, 160);
+                tft.setTextColor(tft.color565(160, 180, 200), cCardBg);
+                tft.print("Collection: rfid_cards");
+
+                tft.setCursor(145, 185);
+                tft.setTextColor(tft.color565(110, 140, 175), cCardBg);
+                tft.print("Tap to return");
+            }
+        } else {
+            // Diagnostic / Menu RFID Screen
+            tft.fillRect(0, 24, 320, 216, tft.color565(18, 22, 42));
+            tft.setTextColor(TFT_WHITE, tft.color565(18, 22, 42));
+            tft.setTextDatum(textdatum_t::top_center);
+            tft.drawString("PN532 RFID READER STATUS", 160, 30);
+
+            tft.setTextDatum(textdatum_t::top_left);
+            tft.setCursor(20, 60);
+            tft.print("Interface: UART1 (GPIO 1/2) 115200");
+            tft.setCursor(20, 85);
+            tft.printf("Last Card UID: %s\n", lastRfidScanned.length() > 0 ? lastRfidScanned.c_str() : "[NO CARD DETECTED]");
+            tft.setCursor(20, 110);
+            tft.print("Mode: MIFARE Classic Educational");
+
+            drawButton(80, 175, 160, 38, "<- BACK TO MENU", tft.color565(40, 50, 70));
+        }
     }
 
     void runTouchCalibration() {
@@ -2434,6 +2643,17 @@ public:
                 break;
             }
 
+            case ActiveScreen::SCREEN_RFID:
+                if (rfidCardView.active) {
+                    rfidCardView.active = false;
+                    setScreen(ActiveScreen::SCREEN_FACE);
+                } else {
+                    if (x >= 80 && x <= 240 && y >= 175 && y <= 213) {
+                        setScreen(ActiveScreen::SCREEN_MENU);
+                    }
+                }
+                break;
+
             case ActiveScreen::SCREEN_WIFI:
                 if (x >= 20 && x <= 150 && y >= 160 && y <= 198) {
                     if (WiFiManagerDriver::getInstance().isPortalActive()) {
@@ -2457,6 +2677,14 @@ public:
 
     void update(RobotState state, bool wifiOk, int rssi, bool wsOk, uint8_t vol) {
         unsigned long now = millis();
+
+        // Auto-return from RFID learning card to robot face after 6 seconds
+        if (currentScreen == ActiveScreen::SCREEN_RFID && rfidCardView.active) {
+            if (now - rfidCardView.displayStartTime >= 6000) {
+                rfidCardView.active = false;
+                setScreen(ActiveScreen::SCREEN_FACE);
+            }
+        }
 
         if (now - lastStatusBarDraw > 1000 || forceRedraw) {
             drawStatusBar(wifiOk, rssi, wsOk, vol);
@@ -2588,6 +2816,7 @@ public:
         }
 
         // 3. PN532 RFID Polling (Supports 4, 7, and 10-byte UIDs without buffer overflow)
+        static unsigned long lastCardTriggerTime = 0;
         if (nfcReady && (now - lastRfidScanTime > 300)) {
             lastRfidScanTime = now;
             uint8_t uid[12];
@@ -2598,14 +2827,18 @@ public:
                     sprintf(hexStr + (i * 2), "%02X", uid[i]);
                 }
                 String cardUid = String(hexStr);
-                if (cardUid != lastScannedUid) {
+                // Debounce same card: trigger if different UID or 2.5s elapsed
+                if (cardUid != lastScannedUid || (now - lastCardTriggerTime > 2500)) {
                     lastScannedUid = cardUid;
+                    lastCardTriggerTime = now;
                     UIManager::getInstance().setLastRfid(cardUid);
                     postEvent(EventType::RFID_CARD_DETECTED, 0, cardUid.c_str());
                     Serial.printf("[Sensors] RFID Scanned UID (%d bytes): %s\n", uidLength, cardUid.c_str());
                 }
             } else {
-                lastScannedUid = "";
+                if (now - lastCardTriggerTime > 1500) {
+                    lastScannedUid = "";
+                }
             }
         }
     }
@@ -2722,7 +2955,7 @@ public:
                       DEFAULT_WS_HOST, DEFAULT_WS_PORT, DEFAULT_WS_PATH);
 
 #ifndef WS_PROBE
-#define WS_PROBE 0
+#define WS_PROBE 1
 #endif
 #if WS_PROBE
         static bool probed = false;
@@ -2862,6 +3095,15 @@ public:
             AudioOutputDriver::getInstance().cancelSession(reason);
             currentSessionGeneration = 0; // Invalidate client session generation immediately
             postEvent(EventType::VOICE_AUDIO_CANCEL);
+        } else if (strcmp(ev, "rfid:result") == 0) {
+            const char* cardUid = data["cardUid"] | "";
+            bool found = data["found"] | false;
+            const char* itemKey = data["itemKey"] | "";
+            const char* nameEn = data["nameEn"] | "";
+            const char* nameMm = data["nameMm"] | "";
+            Serial.printf("[WebSocket] RFID Result: uid=%s, found=%d, item=%s, en=%s, mm=%s\n",
+                          cardUid, (int)found, itemKey, nameEn, nameMm);
+            UIManager::getInstance().showRfidResult(cardUid, found, itemKey, nameEn, nameMm);
         } else if (strcmp(ev, "robot:command") == 0) {
             const char* cmd = data["type"] | "";
             if (strcmp(cmd, "set_volume") == 0) {
@@ -3065,6 +3307,23 @@ public:
         }
         return false;
     }
+
+    bool sendAudioCancel(const char* reason = "user_cancel") {
+        JsonDocument doc;
+        doc["event"] = "audio:cancel";
+        JsonObject data = doc["data"].to<JsonObject>();
+        data["reason"] = reason ? reason : "user_cancel";
+
+        String out;
+        serializeJson(doc, out);
+        if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
+            bool ok = client.available() ? client.send(out) : false;
+            xSemaphoreGive(wsMutex);
+            Serial.printf("[WebSocket] Sent audio:cancel (reason: %s)\n", reason ? reason : "user_cancel");
+            return ok;
+        }
+        return false;
+    }
 };
 
 // ============================================================================
@@ -3094,6 +3353,14 @@ public:
         if (currentState != st) {
             currentState = st;
             Serial.printf("[DeviceManager] State: %s\n", robotStateToString(st));
+
+            // Fix A: Reliable WakeNet re-arming on every transition to IDLE; disarm during any active state
+            if (st == RobotState::IDLE) {
+                WakeWordEngine::getInstance().setListening(true);
+            } else {
+                WakeWordEngine::getInstance().setListening(false);
+            }
+
             switch (st) {
                 case RobotState::IDLE:
                     eyes.setEmotion(RobotEmotion::NEUTRAL);
@@ -3120,7 +3387,7 @@ public:
 
     // Accepts call from IDLE or conversational SPEAKING state
     void startVoiceSession() {
-        if (currentState != RobotState::IDLE && currentState != RobotState::SPEAKING) return;
+        if (currentState != RobotState::IDLE && currentState != RobotState::SPEAKING && currentState != RobotState::THINKING) return;
         if (!WebSocketClientManager::getInstance().isAuthenticated()) {
             Serial.println("[DeviceManager] Cannot start voice: WebSocket not authenticated.");
             return;
@@ -3175,6 +3442,13 @@ public:
                     startVoiceSession();
                 } else if (currentState == RobotState::LISTENING) {
                     endVoiceSession();
+                } else if (currentState == RobotState::SPEAKING || currentState == RobotState::THINKING) {
+                    // Fix B: Immediate barge-in interruption during SPEAKING/THINKING
+                    Serial.println("[DeviceManager] Head-touch barge-in interrupt during SPEAKING/THINKING!");
+                    AudioOutputDriver::getInstance().stopAndFlush();
+                    waitingForPlaybackDrain = false;
+                    WebSocketClientManager::getInstance().sendAudioCancel("touch_barge_in");
+                    startVoiceSession();
                 }
                 break;
 
@@ -3230,6 +3504,7 @@ public:
                 break;
 
             case EventType::RFID_CARD_DETECTED:
+                AudioOutputDriver::getInstance().triggerCuteChime();
                 WebSocketClientManager::getInstance().sendRfidScan(String(ev.text));
                 break;
 

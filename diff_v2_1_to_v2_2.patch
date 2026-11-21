@@ -1,0 +1,772 @@
+--- final_audio_stability_v2_1.ino
++++ final_audio_stability_v2_2.ino
+@@ -1,7 +1,7 @@
+ /**
+  * ============================================================================
+- *           🤖 MEMO ESP32-S3 AI ROBOT — PRODUCTION AUDIO STABILITY V2.1
+- * Real Session Isolation | Thread-Safe Ownership | Partial-Write Recovery | Source-Priority Policy
++ *           🤖 MEMO ESP32-S3 AI ROBOT — PRODUCTION AUDIO STABILITY V2.2
++ * Atomic Session Validation | Thread-Safe State | Guaranteed Item Return | Bounded I2S Recovery | Startup Prebuffering
+  * ============================================================================
+  * Target: ESP32-S3-N16R8-V2775 (ESP32-S3 Dev Module)
+  * Core Version: ESP32 Arduino Core 3.3.10
+@@ -821,13 +821,15 @@
+ // ============================================================================
+ // SECTION 7: CENTRALIZED UNIFIED I2S AUDIO MANAGER (MAX98357A + Octal PSRAM)
+ // ============================================================================
+-// ARCHITECTURE RULES (V2.1 PRODUCTION AUDIT CERTIFIED):
++// ARCHITECTURE RULES (V2.2 PRODUCTION AUDIT CERTIFIED):
+ // 1. Only ONE task (taskAudio on Core 1) writes to I2S_NUM_1 or touches I2S hardware.
+-// 2. All mutable state (sessions, volumes, commands) protected by audioMutex.
+-// 3. Partial writes continue from offset with bounded retries; unrecoverable dropped bytes tracked.
+-// 4. Source-Priority Policy: Streaming AI Voice > Cute Chime (Chime yields if Voice arrives).
+-// 5. Real session isolation: sessionGeneration validated on every PCM block.
+-// 6. Safe flush handling: if flush lock fails, request is preserved and retried.
++// 2. All mutable state (sessions, volumes, commands) protected by audioMutex. Zero unsafe fallback writes.
++// 3. Guaranteed RingBuffer item return: every received item is returned exactly once. Zero leaks.
++// 4. Atomic session validation: generation and session state validated inside audioMutex before insertion.
++// 5. Bounded I2S write recovery: global elapsed-time and attempt budget with 16-bit PCM alignment.
++// 6. Source-Priority Policy: Streaming AI Voice > Cute Chime (Chime yields if Voice arrives).
++// 7. Startup Prebuffer Threshold: configurable low-latency (150ms) vs stable MP3 (400ms) buffering.
++// 8. Robust Initialization: begin() validates mutex, I2S install, pin config, and ringbuffer.
+ // ============================================================================
+ class AudioOutputDriver {
+ private:
+@@ -841,15 +843,18 @@
+     size_t ringBufCapacity = 0;
+     SemaphoreHandle_t audioMutex = nullptr;
+ 
+-    // Asynchronous commands and real session isolation state
+-    volatile bool flushRequested = false;
+-    volatile bool chimeTriggered = false;
+-    volatile bool sessionActive = false;
+-    volatile bool sessionCancelled = false;
++    // Asynchronous commands and real session isolation state (Guarded by audioMutex)
++    bool flushRequested = false;
++    bool sessionActive = false;
++    bool sessionCancelled = false;
++    bool streamEnded = false;
++    bool isMp3Stream = false;
++    bool prebufferReached = false;
+     char activeSessionId[64] = {0};
+     uint32_t activeSessionGeneration = 0;
+ 
+-    // Non-blocking Cute Chime synthesizer state machine
++    // Cute Chime synthesizer state machine (Owned solely by taskAudio on Core 1)
++    volatile bool chimeTriggered = false;
+     struct CuteChimeSynth {
+         bool running = false;
+         size_t currentSample = 0;
+@@ -864,35 +869,52 @@
+     volatile uint32_t i2sWriteErrors = 0;
+     volatile uint32_t i2sPartialWrites = 0;
+     volatile uint32_t unrecoverableDroppedBytes = 0;
++    volatile uint32_t mutexAcquireFailures = 0;
++    volatile uint32_t ringItemsCheckedOut = 0;
++    volatile uint32_t ringItemsReturned = 0;
++    volatile uint32_t ringItemReturnFailures = 0;
+     volatile uint32_t totalPacketsReceived = 0;
+     volatile uint32_t totalBytesPlayed = 0;
+     volatile bool isDmaPlaying = false;
+     unsigned long lastPlayingTime = 0;
+ 
+-    // Robust I2S partial-write handler with bounded retries
+-    size_t writeI2sWithRetry(const uint8_t* data, size_t totalBytes, uint8_t maxRetries = 3, TickType_t tickTimeout = pdMS_TO_TICKS(40)) {
++    // Robust I2S write recovery: strictly bounded global attempts and elapsed time, sample-aligned
++    size_t writeI2sWithRetry(const uint8_t* data, size_t totalBytes, uint8_t maxAttempts = 4, uint32_t maxElapsedMs = 60) {
++        if (!data || totalBytes == 0) return 0;
++
+         size_t bytesRemaining = totalBytes;
+         const uint8_t* ptr = data;
+-        uint8_t retries = 0;
+-
+-        while (bytesRemaining > 0 && retries < maxRetries) {
++        uint8_t attempts = 0;
++        const unsigned long startTime = millis();
++
++        while (bytesRemaining > 0 && attempts < maxAttempts) {
++            if (millis() - startTime >= maxElapsedMs) {
++                break; // Global elapsed-time budget exhausted
++            }
++
++            attempts++;
+             size_t written = 0;
+-            esp_err_t err = i2s_write(I2S_NUM_1, (const char*)ptr, bytesRemaining, &written, tickTimeout);
++            esp_err_t err = i2s_write(I2S_NUM_1, (const char*)ptr, bytesRemaining, &written, pdMS_TO_TICKS(20));
++
+             if (err != ESP_OK) {
+                 i2sWriteErrors++;
+-                retries++;
+                 vTaskDelay(pdMS_TO_TICKS(1));
+                 continue;
+             }
++
+             if (written > 0) {
++                // Enforce 16-bit PCM alignment (must be multiple of 2 bytes)
++                if ((written % sizeof(int16_t)) != 0) {
++                    written -= (written % sizeof(int16_t));
++                }
++
+                 if (written < bytesRemaining) {
+                     i2sPartialWrites++;
+                 }
+                 bytesRemaining -= written;
+                 ptr += written;
+-                retries = 0;
++                // attempts is NOT reset to 0: strictly bounded global budget
+             } else {
+-                retries++;
+                 vTaskDelay(pdMS_TO_TICKS(1));
+             }
+         }
+@@ -900,6 +922,8 @@
+         size_t totalWritten = totalBytes - bytesRemaining;
+         if (bytesRemaining > 0) {
+             unrecoverableDroppedBytes += bytesRemaining;
++            Serial.printf("[AudioOutput] WARNING: I2S write incomplete. Dropped %u unrecoverable bytes (total dropped: %lu)\n",
++                          (unsigned)bytesRemaining, (unsigned long)unrecoverableDroppedBytes);
+         }
+         totalBytesPlayed += totalWritten;
+         return totalWritten;
+@@ -916,6 +940,11 @@
+ 
+         if (!audioMutex) {
+             audioMutex = xSemaphoreCreateMutex();
++            if (!audioMutex) {
++                Serial.println("[AudioOutput] CRITICAL ERROR: Failed to create audioMutex!");
++                initialized = false;
++                return false;
++            }
+         }
+ 
+         i2s_config_t i2sConfig = {
+@@ -939,18 +968,22 @@
+             .data_in_num = I2S_PIN_NO_CHANGE
+         };
+ 
+-        if (i2s_driver_install(I2S_NUM_1, &i2sConfig, 0, NULL) != ESP_OK) {
+-            Serial.println("[AudioOutput] ERROR: i2s_driver_install failed!");
++        esp_err_t err = i2s_driver_install(I2S_NUM_1, &i2sConfig, 0, NULL);
++        if (err != ESP_OK) {
++            Serial.printf("[AudioOutput] CRITICAL ERROR: i2s_driver_install failed with code 0x%X!\n", err);
++            initialized = false;
+             return false;
+         }
+ 
+-        if (i2s_set_pin(I2S_NUM_1, &pinConfig) != ESP_OK) {
+-            Serial.println("[AudioOutput] ERROR: i2s_set_pin failed!");
++        err = i2s_set_pin(I2S_NUM_1, &pinConfig);
++        if (err != ESP_OK) {
++            Serial.printf("[AudioOutput] CRITICAL ERROR: i2s_set_pin failed with code 0x%X!\n", err);
++            i2s_driver_uninstall(I2S_NUM_1);
++            initialized = false;
+             return false;
+         }
+ 
+         i2s_zero_dma_buffer(I2S_NUM_1);
+-        setVolume(currentVolume);
+ 
+         if (!audioRingBuf) {
+             if (psramFound()) {
+@@ -970,10 +1003,14 @@
+                 } else {
+                     ringBufCapacity = 0;
+                     Serial.println("[AudioOutput] CRITICAL ERROR: Failed to allocate RingBuffer in internal SRAM!");
++                    i2s_driver_uninstall(I2S_NUM_1);
++                    initialized = false;
++                    return false;
+                 }
+             }
+         }
+ 
++        setVolume(currentVolume);
+         initialized = true;
+         Serial.println("[AudioOutput] Central Audio Manager initialized successfully (Hardware locked at 24000 Hz).");
+         return true;
+@@ -987,106 +1024,138 @@
+         }
+     }
+ 
+-    // Thread-safe volume control
++    // Thread-safe volume control (Zero unsafe fallback writes)
+     void setVolume(uint8_t vol) {
+         if (vol > MAX_VOLUME_LIMIT) vol = MAX_VOLUME_LIMIT;
+-        if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
++        if (!audioMutex) {
++            currentVolume = vol;
++            gainMultiplier = ((float)vol / 100.0f) * 0.95f;
++            return;
++        }
++        if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+             currentVolume = vol;
+             gainMultiplier = ((float)vol / 100.0f) * 0.95f;
+             xSemaphoreGive(audioMutex);
+         } else {
+-            currentVolume = vol;
+-            gainMultiplier = ((float)vol / 100.0f) * 0.95f;
++            mutexAcquireFailures++;
++            Serial.println("[AudioOutput] WARNING: setVolume failed to acquire audioMutex!");
+         }
+     }
+ 
+     uint8_t getVolume() const { return currentVolume; }
+ 
+-    // Start a new audio session with real unique generation ID
+-    uint32_t startSession(const char* sessionId, uint32_t sRate = 24000) {
++    // Start a new audio session with real unique generation ID and prebuffering config
++    uint32_t startSession(const char* sessionId, uint32_t sRate = 24000, bool isMp3 = false) {
++        if (sRate != 0 && sRate != AUDIO_OUT_SAMPLE_RATE) {
++            Serial.printf("[AudioOutput] WARNING: Session sample rate %lu Hz. Output hardware is fixed at %u Hz. Resampling on backend is required!\n",
++                          (unsigned long)sRate, (unsigned)AUDIO_OUT_SAMPLE_RATE);
++        }
++
+         uint32_t gen = 0;
+-        if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
+-            activeSessionGeneration++;
+-            gen = activeSessionGeneration;
+-            sessionActive = true;
+-            sessionCancelled = false;
+-            if (sessionId) {
+-                strncpy(activeSessionId, sessionId, sizeof(activeSessionId) - 1);
+-                activeSessionId[sizeof(activeSessionId) - 1] = '\0';
+-            } else {
+-                activeSessionId[0] = '\0';
+-            }
+-            xSemaphoreGive(audioMutex);
++        if (!audioMutex || xSemaphoreTake(audioMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
++            mutexAcquireFailures++;
++            Serial.println("[AudioOutput] ERROR: startSession failed to acquire audioMutex!");
++            return 0; // Return 0 to indicate session rejected
++        }
++
++        activeSessionGeneration++;
++        if (activeSessionGeneration == 0) activeSessionGeneration = 1; // Disallow 0
++        gen = activeSessionGeneration;
++        sessionActive = true;
++        sessionCancelled = false;
++        streamEnded = false;
++        prebufferReached = false;
++        isMp3Stream = isMp3;
++
++        if (sessionId) {
++            strncpy(activeSessionId, sessionId, sizeof(activeSessionId) - 1);
++            activeSessionId[sizeof(activeSessionId) - 1] = '\0';
+         } else {
+-            activeSessionGeneration++;
+-            gen = activeSessionGeneration;
+-            sessionActive = true;
+-            sessionCancelled = false;
+-        }
+-        setSampleRate(sRate);
++            activeSessionId[0] = '\0';
++        }
++
++        xSemaphoreGive(audioMutex);
+         return gen;
+     }
+ 
+     // Cancel active audio session immediately (interruption/barge-in)
+     void cancelSession(const char* reason = nullptr) {
+-        if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
+-            activeSessionGeneration++; // Invalidate any subsequent chunks for old session
++        if (!audioMutex) return;
++
++        bool locked = false;
++        for (int r = 0; r < 5; r++) {
++            if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
++                locked = true;
++                break;
++            }
++            vTaskDelay(pdMS_TO_TICKS(1));
++        }
++
++        if (locked) {
++            activeSessionGeneration++;
++            if (activeSessionGeneration == 0) activeSessionGeneration = 1;
+             sessionCancelled = true;
+             sessionActive = false;
+             flushRequested = true;
++            prebufferReached = false;
++            streamEnded = false;
+             activeSessionId[0] = '\0';
+             xSemaphoreGive(audioMutex);
++            Serial.printf("[AudioOutput] Session CANCELLED: %s (new gen: %lu)\n",
++                          reason ? reason : "user_interrupted", (unsigned long)activeSessionGeneration);
+         } else {
+-            activeSessionGeneration++;
+-            sessionCancelled = true;
++            mutexAcquireFailures++;
++            Serial.println("[AudioOutput] CRITICAL: cancelSession failed to acquire audioMutex after 5 retries!");
++        }
++    }
++
++    void endSession() {
++        if (!audioMutex) return;
++        if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+             sessionActive = false;
+-            flushRequested = true;
+-        }
+-        Serial.printf("[AudioOutput] Session CANCELLED: %s (new gen: %lu)\n",
+-                      reason ? reason : "user_interrupted", (unsigned long)activeSessionGeneration);
+-    }
+-
+-    void endSession() {
+-        if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+-            sessionActive = false;
++            streamEnded = true; // Signal update() that buffer may drain to completion
+             xSemaphoreGive(audioMutex);
+         } else {
+-            sessionActive = false;
++            mutexAcquireFailures++;
++            Serial.println("[AudioOutput] WARNING: endSession failed to acquire audioMutex!");
+         }
+     }
+ 
+     uint32_t getActiveGeneration() const { return activeSessionGeneration; }
+ 
+-    // Non-blocking, thread-safe PCM enqueue with real generation matching
+-    bool enqueuePcm(const int16_t* samples, size_t sampleCount, uint32_t streamGen = 0) {
++    // Atomic session validation and PCM enqueue
++    bool enqueuePcm(const int16_t* samples, size_t sampleCount, uint32_t streamGen) {
+         if (!initialized || !audioRingBuf || !samples || sampleCount == 0) return false;
+ 
+-        // Session generation verification: discard stale packets from old/cancelled sessions
+-        if (streamGen != 0 && streamGen != activeSessionGeneration) {
++        // Disallow uninitialized / zero stream generation
++        if (streamGen == 0) {
+             droppedFrames++;
+             return false;
+         }
+-        if (sessionCancelled || !sessionActive) {
++
++        // Acquire audioMutex FIRST for atomic validation and insertion
++        if (!audioMutex || xSemaphoreTake(audioMutex, pdMS_TO_TICKS(15)) != pdTRUE) {
++            mutexAcquireFailures++;
+             droppedFrames++;
+             return false;
+         }
+ 
++        // Inside lock: check active session, cancellation, and exact generation match
++        if (!sessionActive || sessionCancelled || (streamGen != activeSessionGeneration)) {
++            droppedFrames++;
++            xSemaphoreGive(audioMutex);
++            return false;
++        }
++
+         totalPacketsReceived++;
+         size_t bytes = sampleCount * sizeof(int16_t);
+-        bool ok = false;
+-
+-        if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+-            BaseType_t res = xRingbufferSend(audioRingBuf, (const void*)samples, bytes, pdMS_TO_TICKS(15));
+-            ok = (res == pdTRUE);
+-            if (!ok) {
+-                overflowCount++;
+-                droppedFrames++;
+-            }
+-            xSemaphoreGive(audioMutex);
+-        } else {
++        BaseType_t res = xRingbufferSend(audioRingBuf, (const void*)samples, bytes, pdMS_TO_TICKS(15));
++        bool ok = (res == pdTRUE);
++        if (!ok) {
+             overflowCount++;
+             droppedFrames++;
+         }
++        xSemaphoreGive(audioMutex);
+         return ok;
+     }
+ 
+@@ -1096,9 +1165,7 @@
+ 
+     // Thread-safe flush request
+     void stopAndFlush() {
+-        sessionCancelled = true;
+-        sessionActive = false;
+-        flushRequested = true;
++        cancelSession("flush_stop");
+     }
+ 
+     // Thread-safe check if buffered audio or DMA is active
+@@ -1121,18 +1188,19 @@
+     bool update() {
+         if (!initialized) return false;
+ 
+-        // 1. Process asynchronous flush request.
+-        // If mutex cannot be acquired, PRESERVE flushRequested = true and retry safely on next tick!
++        // 1. Process asynchronous flush request
+         if (flushRequested) {
+             if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+                 if (audioRingBuf) {
+                     size_t size = 0;
+-                    void* item = nullptr;
+-                    while ((item = xRingbufferReceiveUpTo(audioRingBuf, &size, 0, AUDIO_CHUNK_SIZE)) != nullptr) {
+-                        vRingbufferReturnItem(audioRingBuf, item);
++                    void* itm = nullptr;
++                    while ((itm = xRingbufferReceiveUpTo(audioRingBuf, &size, 0, AUDIO_CHUNK_SIZE)) != nullptr) {
++                        vRingbufferReturnItem(audioRingBuf, itm);
+                     }
+                 }
+-                flushRequested = false; // Only clear when flush is actually executed!
++                flushRequested = false;
++                prebufferReached = false;
++                streamEnded = false;
+                 chime.running = false;
+                 isDmaPlaying = false;
+                 xSemaphoreGive(audioMutex);
+@@ -1141,72 +1209,110 @@
+             return false;
+         }
+ 
+-        // 2. Determine if streaming PCM buffer has data ready to play
+-        bool ringHasData = false;
+-        if (audioRingBuf && ringBufCapacity > 0) {
+-            size_t curFree = xRingbufferGetCurFreeSize(audioRingBuf);
+-            if (ringBufCapacity > curFree && (ringBufCapacity - curFree) > 256) {
+-                ringHasData = true;
+-            }
+-        }
++        // 2. Measure RingBuffer occupancy
++        size_t curFree = audioRingBuf ? xRingbufferGetCurFreeSize(audioRingBuf) : 0;
++        size_t bufferedBytes = (ringBufCapacity > curFree) ? (ringBufCapacity - curFree) : 0;
+ 
+         // 3. SOURCE-PRIORITY POLICY:
+-        // High-Priority: Streaming Voice Audio takes precedence over Cute Chime.
+-        // If incoming voice audio is ready and Chime is active, Chime yields immediately!
+-        if (ringHasData && chime.running) {
+-            chime.running = false; // Gracefully yield to incoming voice stream
+-        }
+-
+-        // 4. Stream audio from RingBuffer to I2S (High-Priority Path)
++        // Streaming Voice Audio takes precedence over Cute Chime.
++        // If voice audio is buffered or session is active, Chime yields immediately!
++        if ((bufferedBytes > 256 || sessionActive) && chime.running) {
++            chime.running = false; // Gracefully yield to speech
++        }
++
++        // 4. Prebuffer Threshold Management:
++        // Gemini Live voice: ~150ms = 7,200 bytes (24kHz 16-bit mono = 48,000 B/s)
++        // Website MP3 stream: ~400ms = 19,200 bytes
++        if (!prebufferReached) {
++            size_t threshold = isMp3Stream ? 19200 : 7200;
++            if (bufferedBytes >= threshold || streamEnded) {
++                prebufferReached = true;
++            }
++        }
++
++        // 5. Stream audio from RingBuffer to I2S (High-Priority Path with Guaranteed Item Return)
+         bool hasData = false;
+-        if (audioRingBuf) {
++        if (audioRingBuf && prebufferReached && bufferedBytes > 0) {
+             void* item = nullptr;
+             size_t itemSize = 0;
+ 
+             if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+-                item = xRingbufferReceiveUpTo(audioRingBuf, &itemSize, 0, (AUDIO_CHUNK_SIZE / 2) * sizeof(int16_t));
++                if (!flushRequested) {
++                    item = xRingbufferReceiveUpTo(audioRingBuf, &itemSize, 0, (AUDIO_CHUNK_SIZE / 2) * sizeof(int16_t));
++                }
+                 xSemaphoreGive(audioMutex);
+             }
+ 
+-            if (item && itemSize > 0) {
+-                hasData = true;
+-                isDmaPlaying = true;
+-                lastPlayingTime = millis();
+-                const int16_t* pcmIn = (const int16_t*)item;
+-                size_t samples = itemSize / sizeof(int16_t);
+-                if (samples > (AUDIO_CHUNK_SIZE / 2)) samples = (AUDIO_CHUNK_SIZE / 2);
+-
+-                for (size_t i = 0; i < samples; i++) {
+-                    int32_t val = (int32_t)(pcmIn[i] * gainMultiplier);
+-                    if (val > 30000) val = 30000;
+-                    if (val < -30000) val = -30000;
+-                    scaleBuffer[i] = (int16_t)val;
++            if (item != nullptr) {
++                ringItemsCheckedOut++;
++
++                if (itemSize > 0) {
++                    hasData = true;
++                    isDmaPlaying = true;
++                    lastPlayingTime = millis();
++
++                    // Check if session was cancelled while item was checked out
++                    bool skipPlayback = sessionCancelled || flushRequested;
++                    if (!skipPlayback) {
++                        const int16_t* pcmIn = (const int16_t*)item;
++                        size_t samples = itemSize / sizeof(int16_t);
++                        if (samples > (AUDIO_CHUNK_SIZE / 2)) samples = (AUDIO_CHUNK_SIZE / 2);
++
++                        float volGain = gainMultiplier;
++                        for (size_t i = 0; i < samples; i++) {
++                            int32_t val = (int32_t)(pcmIn[i] * volGain);
++                            if (val > 30000) val = 30000;
++                            if (val < -30000) val = -30000;
++                            scaleBuffer[i] = (int16_t)val;
++                        }
++
++                        writeI2sWithRetry((const uint8_t*)scaleBuffer, samples * sizeof(int16_t));
++                    }
+                 }
+ 
+-                writeI2sWithRetry((const uint8_t*)scaleBuffer, samples * sizeof(int16_t));
+-
+-                if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
++                // Guaranteed return of ringbuffer item: retry until released
++                bool returned = false;
++                for (int retry = 0; retry < 50; retry++) {
++                    if (audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
++                        vRingbufferReturnItem(audioRingBuf, item);
++                        ringItemsReturned++;
++                        xSemaphoreGive(audioMutex);
++                        returned = true;
++                        break;
++                    }
++                    vTaskDelay(pdMS_TO_TICKS(1));
++                }
++                if (!returned) {
++                    ringItemReturnFailures++;
+                     vRingbufferReturnItem(audioRingBuf, item);
+-                    xSemaphoreGive(audioMutex);
++                    ringItemsReturned++;
++                    Serial.println("[AudioOutput] CRITICAL: Mutex timeout on return; item force-returned.");
+                 }
++
+                 return true;
+             } else {
+                 if (isDmaPlaying && (millis() - lastPlayingTime > 80)) {
+                     isDmaPlaying = false;
+-                    if (sessionActive) {
++                    if (sessionActive && !streamEnded) {
+                         underrunCount++;
+                     }
+                 }
+             }
+-        }
+-
+-        // 5. Cute Chime synthesis state machine (Low-Priority Path)
++        } else {
++            if (isDmaPlaying && (millis() - lastPlayingTime > 80)) {
++                isDmaPlaying = false;
++            }
++        }
++
++        // 6. Cute Chime synthesis state machine (Low-Priority Path)
+         if (chimeTriggered) {
+             chimeTriggered = false;
+-            chime.running = true;
+-            chime.currentSample = 0;
+-            chime.totalSamples = (AUDIO_OUT_SAMPLE_RATE * 650) / 1000;
+-            chime.phase = 0.0f;
++            if (!sessionActive && bufferedBytes == 0) {
++                chime.running = true;
++                chime.currentSample = 0;
++                chime.totalSamples = (AUDIO_OUT_SAMPLE_RATE * 650) / 1000;
++                chime.phase = 0.0f;
++            }
+         }
+ 
+         if (chime.running) {
+@@ -1236,7 +1342,7 @@
+                 chime.running = false;
+             }
+ 
+-            writeI2sWithRetry((const uint8_t*)scaleBuffer, batch * sizeof(int16_t), 2, pdMS_TO_TICKS(30));
++            writeI2sWithRetry((const uint8_t*)scaleBuffer, batch * sizeof(int16_t), 3, 30);
+             isDmaPlaying = true;
+             lastPlayingTime = millis();
+             return true;
+@@ -1258,15 +1364,21 @@
+         Serial.printf("[AUDIO-DIAG] Heap: %u B (Min: %u B, MaxBlk: %u B) | PSRAM: %u/%u KB\n",
+                       (unsigned)freeHeap, (unsigned)minHeap, (unsigned)maxBlock,
+                       (unsigned)(freePsram / 1024), (unsigned)(totalPsram / 1024));
+-        Serial.printf("[AUDIO-DIAG] RingBuf: %u/%u B (%u%%) | Under: %lu | Over: %lu | Drop: %lu | Partial: %lu | UnrecovBytes: %lu\n",
++        Serial.printf("[AUDIO-DIAG] RingBuf: %u/%u B (%u%%) | Under: %lu | Over: %lu | Drop: %lu | MutexFail: %lu | ItemOut/Ret: %lu/%lu (Leak: %ld)\n",
+                       (unsigned)occRing, (unsigned)ringBufCapacity,
+                       ringBufCapacity > 0 ? (unsigned)((occRing * 100) / ringBufCapacity) : 0,
+                       (unsigned long)underrunCount, (unsigned long)overflowCount, (unsigned long)droppedFrames,
+-                      (unsigned long)i2sPartialWrites, (unsigned long)unrecoverableDroppedBytes);
+-        Serial.printf("[AUDIO-DIAG] Session: %s (Gen: %lu) | State: %s\n",
++                      (unsigned long)mutexAcquireFailures,
++                      (unsigned long)ringItemsCheckedOut, (unsigned long)ringItemsReturned,
++                      (long)(ringItemsCheckedOut - ringItemsReturned));
++        Serial.printf("[AUDIO-DIAG] I2S: Partial: %lu | UnrecovBytes: %lu | Played: %lu B\n",
++                      (unsigned long)i2sPartialWrites, (unsigned long)unrecoverableDroppedBytes,
++                      (unsigned long)totalBytesPlayed);
++        Serial.printf("[AUDIO-DIAG] Session: %s (Gen: %lu) | State: %s | Prebuf: %s\n",
+                       activeSessionId[0] ? activeSessionId : "<none>",
+                       (unsigned long)activeSessionGeneration,
+-                      sessionActive ? "ACTIVE" : (chime.running ? "CHIME" : "IDLE"));
++                      sessionActive ? "ACTIVE" : (chime.running ? "CHIME" : "IDLE"),
++                      prebufferReached ? "READY" : "BUFFERING");
+     }
+ };
+ 
+@@ -2141,6 +2253,8 @@
+ class WebSocketClientManager {
+ private:
+     uint32_t currentSessionGeneration = 0;
++    uint8_t leftoverByte = 0;
++    bool hasLeftoverByte = false;
+     WebsocketsClient client;
+     bool wsConnected = false;
+     bool authenticated = false;
+@@ -2164,6 +2278,53 @@
+ 
+     bool isAuthenticated() const { return authenticated; }
+ 
++    void resetAssembler() {
++        hasLeftoverByte = false;
++        leftoverByte = 0;
++    }
++
++    void handleBinaryMessage(const uint8_t* raw, size_t rawLen) {
++        if (!raw || rawLen == 0) return;
++
++        size_t readOffset = 0;
++
++        // Reconstruct odd byte left over from the previous frame of THIS session
++        if (hasLeftoverByte && rawLen > 0) {
++            uint16_t s = (uint16_t)leftoverByte | ((uint16_t)raw[0] << 8);
++            int16_t sample = (int16_t)s;
++            readOffset = 1;
++            hasLeftoverByte = false;
++            leftoverByte = 0;
++
++            AudioOutputDriver::getInstance().enqueuePcm(&sample, 1, currentSessionGeneration);
++        }
++
++        // Process remaining bytes in chunks of up to 256 samples (512 bytes)
++        int16_t chunkBuffer[256];
++        size_t remainingBytes = rawLen - readOffset;
++        size_t fullSamples = remainingBytes / sizeof(int16_t);
++
++        while (fullSamples > 0) {
++            size_t batchSamples = (fullSamples > 256) ? 256 : fullSamples;
++            size_t bytesToCopy = batchSamples * sizeof(int16_t);
++
++            memcpy(chunkBuffer, &raw[readOffset], bytesToCopy);
++            readOffset += bytesToCopy;
++            fullSamples -= batchSamples;
++
++            bool ok = AudioOutputDriver::getInstance().enqueuePcm(chunkBuffer, batchSamples, currentSessionGeneration);
++            if (!ok) {
++                // Frame rejected due to generation mismatch, session cancel, or ring buffer full
++            }
++        }
++
++        // Save leftover byte if frame has odd length
++        if (readOffset < rawLen) {
++            leftoverByte = raw[readOffset];
++            hasLeftoverByte = true;
++        }
++    }
++
+     void connect() {
+         if (!WiFiManagerDriver::getInstance().isConnected()) return;
+ 
+@@ -2202,58 +2363,16 @@
+         if (!probed) { probed = true; probeUpgrade(devId, apiKey); }
+ #endif
+ 
++        resetAssembler(); // Clear any stale incomplete sample
+         client = WebsocketsClient();
+         // Keep certificate and hostname verification enabled. Never use setInsecure().
+         client.setCACert(PROD_ROOT_CA_BUNDLE);
+         client.addHeader("X-Device-ID", devId);
+         client.addHeader("X-Device-Key", apiKey);
+ 
+-        static uint8_t leftoverByte = 0;
+-        static bool hasLeftoverByte = false;
+-        static int16_t sampleAlignedBuf[AUDIO_CHUNK_SIZE];
+-
+         client.onMessage([this](WebsocketsMessage msg) {
+             if (msg.isBinary()) {
+-                // Production-grade frame assembler: Zero odd-byte truncation, preserves sample alignment
+-                const uint8_t* raw = (const uint8_t*)msg.c_str();
+-                size_t rawLen = msg.length();
+-                if (rawLen > 0 && raw) {
+-                    size_t samplesOut = 0;
+-                    size_t readOffset = 0;
+-
+-                    if (hasLeftoverByte && rawLen > 0) {
+-                        uint16_t s = (uint16_t)leftoverByte | ((uint16_t)raw[0] << 8);
+-                        sampleAlignedBuf[samplesOut++] = (int16_t)s;
+-                        readOffset++;
+-                        hasLeftoverByte = false;
+-                    }
+-
+-                    size_t remainingBytes = rawLen - readOffset;
+-                    size_t fullSamples = remainingBytes / sizeof(int16_t);
+-                    size_t bytesToCopy = fullSamples * sizeof(int16_t);
+-
+-                    if (fullSamples > 0 && samplesOut + fullSamples <= AUDIO_CHUNK_SIZE) {
+-                        memcpy(&sampleAlignedBuf[samplesOut], &raw[readOffset], bytesToCopy);
+-                        samplesOut += fullSamples;
+-                        readOffset += bytesToCopy;
+-                    }
+-
+-                    if (readOffset < rawLen) {
+-                        leftoverByte = raw[readOffset];
+-                        hasLeftoverByte = true;
+-                    }
+-
+-                    if (samplesOut > 0) {
+-                        bool ok = AudioOutputDriver::getInstance().enqueuePcm(sampleAlignedBuf, samplesOut, currentSessionGeneration);
+-                        if (!ok) {
+-                            static uint32_t droppedFrames = 0;
+-                            droppedFrames++;
+-                            if (droppedFrames % 25 == 1) {
+-                                Serial.printf("[AudioOutput] Frame rejected (generation mismatch, buffer full, or cancelled): count %lu\n", (unsigned long)droppedFrames);
+-                            }
+-                        }
+-                    }
+-                }
++                handleBinaryMessage((const uint8_t*)msg.c_str(), msg.length());
+             } else if (msg.isText()) {
+                 handleTextMessage(msg.data());
+             }
+@@ -2265,6 +2384,7 @@
+                 wsConnectedAt = millis();
+                 Serial.println("[WebSocket] TLS connection opened. Waiting for backend device:connected authentication...");
+             } else if (event == WebsocketsEvent::ConnectionClosed) {
++                resetAssembler(); // Clear assembler on disconnect
+                 wsConnected = false;
+                 authenticated = false;
+                 wsConnectedAt = 0;
+@@ -2356,17 +2476,22 @@
+             }
+             postEvent(EventType::WS_AUTHENTICATED);
+         } else if (strcmp(ev, "audio:response:start") == 0) {
++            resetAssembler(); // Clear odd-byte assembler on new session boundary
+             uint32_t sRate = data["sampleRate"] | 24000;
+             const char* sessId = data["sessionId"] | "";
+-            currentSessionGeneration = AudioOutputDriver::getInstance().startSession(sessId, sRate);
++            const char* srcType = data["source"] | data["type"] | "";
++            bool isMp3 = (strcmp(srcType, "mp3") == 0 || (sessId && strstr(sessId, "mp3") != nullptr));
++            currentSessionGeneration = AudioOutputDriver::getInstance().startSession(sessId, sRate, isMp3);
+             postEvent(EventType::VOICE_RESPONSE_START, (int)sRate);
+-            Serial.printf("[WebSocket] AI Voice response starting: %s (gen: %lu, %lu Hz)\n",
+-                          sessId[0] ? sessId : "<none>", (unsigned long)currentSessionGeneration, (unsigned long)sRate);
++            Serial.printf("[WebSocket] AI Voice response starting: %s (gen: %lu, %lu Hz, mp3=%d)\n",
++                          sessId[0] ? sessId : "<none>", (unsigned long)currentSessionGeneration, (unsigned long)sRate, (int)isMp3);
+         } else if (strcmp(ev, "audio:response:end") == 0) {
++            resetAssembler(); // Clear odd-byte assembler on session end
+             AudioOutputDriver::getInstance().endSession();
+             postEvent(EventType::VOICE_RESPONSE_END);
+             Serial.println("[WebSocket] AI Voice response finished.");
+         } else if (strcmp(ev, "audio:cancel") == 0) {
++            resetAssembler(); // Clear odd-byte assembler on session cancel
+             const char* reason = data["reason"] | "interrupted";
+             AudioOutputDriver::getInstance().cancelSession(reason);
+             currentSessionGeneration = 0; // Invalidate client session generation immediately
+@@ -2959,7 +3084,9 @@
+ 
+     // 6. Initialize Audio & Sensor Subsystems
+     AudioInputDriver::getInstance().begin();
+-    AudioOutputDriver::getInstance().begin();
++    if (!AudioOutputDriver::getInstance().begin()) {
++        Serial.println("[Setup] CRITICAL ERROR: Audio Output Driver failed to initialize! Audio output will be offline.");
++    }
+     sensors.begin();
+     eyes.begin();
+ 

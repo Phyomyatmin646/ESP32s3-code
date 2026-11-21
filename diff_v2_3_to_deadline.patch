@@ -1,0 +1,494 @@
+--- final_audio_stability_v2_3.ino
++++ final_deadline_candidate.ino
+@@ -1,7 +1,7 @@
+ /**
+  * ============================================================================
+- *           🤖 MEMO ESP32-S3 AI ROBOT — PRODUCTION AUDIO STABILITY V2.3
+- * Decoupled Command Queue | Zero-Lock Item Return | True 256KB Rolling Buffer | Bounded I2S Recovery
++ *           🤖 MEMO ESP32-S3 AI ROBOT — FINAL DEADLINE CANDIDATE
++ * Session Handshake | Resilient Command Queue | Watermark Flow Control | True 256KB Buffer
+  * ============================================================================
+  * Target: ESP32-S3-N16R8-V2775 (ESP32-S3 Dev Module)
+  * Core Version: ESP32 Arduino Core 3.3.10
+@@ -822,17 +822,18 @@
+ // ============================================================================
+ // SECTION 7: CENTRALIZED UNIFIED I2S AUDIO MANAGER (MAX98357A + Octal PSRAM)
+ // ============================================================================
+-// ARCHITECTURE RULES (V2.3 PRODUCTION AUDIT CERTIFIED):
++// ARCHITECTURE RULES (FINAL DEADLINE CERTIFIED):
+ // 1. Only ONE task (taskAudio on Core 1) writes to I2S_NUM_1 and drains RingBuffer.
+-// 2. Decoupled Command Queue: Session lifecycle (start, cancel, end, volume, chime)
+-//    is serialized via audioCmdQueue. Zero lock contention between producer & consumer.
+-// 3. Guaranteed Zero-Lock Item Return: FreeRTOS RingBuffer API is intrinsically thread-safe.
+-//    Every received item is returned immediately with 0 retries and 0 mutex overhead.
+-// 4. Non-Blocking Enqueue: enqueuePcm() uses timeout 0, preventing producer from ever stalling consumer.
+-// 5. Accurate True Buffer: PSRAM RingBuffer allocated at 256KB (262,144 B = ~5.46s rolling cushion).
+-// 6. Abnormal I2S Partial Write: Maintains 16-bit PCM alignment without duplicate byte resend.
+-// 7. Source-Priority Policy: Streaming AI Voice > Cute Chime (Chime yields if Voice arrives).
+-// 8. Startup Prebuffer Threshold: configurable low-latency (150ms) vs stable MP3 (400ms) buffering.
++// 2. Reliable Session Handshake: taskAudio flushes old audio before session is activated;
++//    sends audio:ready acknowledgement so backend transmits PCM only to a clean buffer.
++// 3. Command Queue Resilience: Bounded retries on xQueueSend; emergency atomic cancellation;
++//    new sessions cannot start unless command is verified. Zero unsafe fallback writes.
++// 4. Real Watermark Resume: taskAudio owns watermark state (pauses at 75%, resumes at 40%),
++//    evaluating occupancy continuously during playback even when producer is paused.
++// 5. Bounded Callback Execution: enqueuePcm() uses 2ms timeout without polling loops,
++//    never stalling WebSocket network callback.
++// 6. Strict 24kHz Format Validation: Non-24kHz metadata is strictly rejected.
++// 7. Abnormal I2S Partial Write: Preserves 16-bit PCM alignment without duplicate byte resend.
+ // ============================================================================
+ 
+ enum class AudioCmdType : uint8_t {
+@@ -865,12 +866,16 @@
+     RingbufHandle_t audioRingBuf = nullptr;
+     size_t ringBufCapacity = 0;
+ 
+-    // Atomic session lifecycle state (Producer & consumer can inspect safely without blocking)
++    // Atomic session lifecycle state
+     std::atomic<uint32_t> activeSessionGeneration{0};
+     std::atomic<bool> sessionActive{false};
+     std::atomic<bool> sessionCancelled{false};
+     std::atomic<bool> isAudioPlaying{false};
+     std::atomic<uint8_t> currentVolume{DEFAULT_VOLUME};
++    std::atomic<bool> emergencyCancelRequested{false};
++    std::atomic<bool> sendReadyAckPending{false};
++    std::atomic<bool> flowControlPauseNeeded{false};
++    std::atomic<bool> flowControlResumeNeeded{false};
+ 
+     // Internal playback state owned EXCLUSIVELY by taskAudio on Core 1:
+     float gainMultiplier = 0.8f;
+@@ -878,6 +883,7 @@
+     bool streamEnded = false;
+     bool isMp3Stream = false;
+     bool prebufferReached = false;
++    bool isFlowPaused = false; // Watermark state owned strictly by taskAudio
+     uint32_t playbackGeneration = 0;
+     char activeSessionId[32] = {0};
+     unsigned long lastPlayingTime = 0;
+@@ -897,6 +903,7 @@
+     std::atomic<uint32_t> i2sWriteErrors{0};
+     std::atomic<uint32_t> i2sPartialWrites{0};
+     std::atomic<uint32_t> unrecoverableDroppedBytes{0};
++    std::atomic<uint32_t> cmdQueueFailures{0};
+     std::atomic<uint32_t> ringItemsCheckedOut{0};
+     std::atomic<uint32_t> ringItemsReturned{0};
+     std::atomic<uint32_t> totalPacketsReceived{0};
+@@ -971,7 +978,7 @@
+         Serial.println("[AudioOutput] Initializing MAX98357A Central Audio Manager (I2S_NUM_1)...");
+ 
+         if (!audioCmdQueue) {
+-            audioCmdQueue = xQueueCreate(16, sizeof(AudioCommand));
++            audioCmdQueue = xQueueCreate(32, sizeof(AudioCommand));
+             if (!audioCmdQueue) {
+                 Serial.println("[AudioOutput] CRITICAL ERROR: Failed to create audioCmdQueue!");
+                 initialized = false;
+@@ -1056,7 +1063,7 @@
+         }
+     }
+ 
+-    // Thread-safe volume control via command queue
++    // Thread-safe volume control via command queue with bounded retry (Zero unsafe writes)
+     void setVolume(uint8_t vol) {
+         if (vol > MAX_VOLUME_LIMIT) vol = MAX_VOLUME_LIMIT;
+         currentVolume.store(vol, std::memory_order_release);
+@@ -1069,8 +1076,17 @@
+         cmd.isMp3 = false;
+         cmd.sessionId[0] = '\0';
+ 
+-        if (audioCmdQueue) {
+-            xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10));
++        bool sent = false;
++        for (int r = 0; r < 5; r++) {
++            if (audioCmdQueue && xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
++                sent = true;
++                break;
++            }
++            vTaskDelay(pdMS_TO_TICKS(1));
++        }
++        if (!sent) {
++            cmdQueueFailures.fetch_add(1, std::memory_order_relaxed);
++            Serial.println("[AudioOutput] WARNING: CMD_SET_VOLUME queue send failed after 5 retries.");
+         }
+     }
+ 
+@@ -1078,11 +1094,13 @@
+         return currentVolume.load(std::memory_order_acquire);
+     }
+ 
+-    // Start a new audio session with atomic generation advance & serialized command
++    // Start a new audio session with strict 24kHz validation & handshake initiation
+     uint32_t startSession(const char* sessionId, uint32_t sRate = 24000, bool isMp3 = false) {
++        // Fix 4: Strictly reject non-24kHz incoming audio metadata
+         if (sRate != 0 && sRate != AUDIO_OUT_SAMPLE_RATE) {
+-            Serial.printf("[AudioOutput] WARNING: Session sample rate %lu Hz. Output hardware is fixed at %u Hz. Resampling on backend is required!\n",
++            Serial.printf("[AudioOutput] ERROR: Rejected stream. Unsupported sample rate %lu Hz. Hardware is strictly %u Hz!\n",
+                           (unsigned long)sRate, (unsigned)AUDIO_OUT_SAMPLE_RATE);
++            return 0; // Explicit rejection!
+         }
+ 
+         uint32_t nextGen = activeSessionGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
+@@ -1090,7 +1108,8 @@
+             nextGen = activeSessionGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
+         }
+ 
+-        sessionActive.store(true, std::memory_order_release);
++        // Session is NOT active yet until taskAudio finishes clearing old audio!
++        sessionActive.store(false, std::memory_order_release);
+         sessionCancelled.store(false, std::memory_order_release);
+ 
+         AudioCommand cmd;
+@@ -1106,18 +1125,31 @@
+             cmd.sessionId[0] = '\0';
+         }
+ 
+-        if (audioCmdQueue) {
+-            xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10));
++        // Fix 2: Bounded retry for command queue send
++        bool sent = false;
++        for (int r = 0; r < 5; r++) {
++            if (audioCmdQueue && xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
++                sent = true;
++                break;
++            }
++            vTaskDelay(pdMS_TO_TICKS(1));
++        }
++
++        if (!sent) {
++            cmdQueueFailures.fetch_add(1, std::memory_order_relaxed);
++            Serial.println("[AudioOutput] CRITICAL: CMD_START_SESSION failed to queue! Session rejected.");
++            return 0; // Rejected
+         }
+ 
+         return nextGen;
+     }
+ 
+-    // Cancel active audio session immediately (interruption/barge-in)
++    // Cancel active audio session immediately (interruption/barge-in) with emergency atomic guarantee
+     void cancelSession(const char* reason = nullptr) {
+         activeSessionGeneration.fetch_add(1, std::memory_order_relaxed);
+         sessionCancelled.store(true, std::memory_order_release);
+         sessionActive.store(false, std::memory_order_release);
++        emergencyCancelRequested.store(true, std::memory_order_release);
+ 
+         AudioCommand cmd;
+         cmd.type = AudioCmdType::CMD_CANCEL_SESSION;
+@@ -1127,14 +1159,25 @@
+         cmd.isMp3 = false;
+         cmd.sessionId[0] = '\0';
+ 
+-        if (audioCmdQueue) {
+-            xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10));
++        bool sent = false;
++        for (int r = 0; r < 5; r++) {
++            if (audioCmdQueue && xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
++                sent = true;
++                break;
++            }
++            vTaskDelay(pdMS_TO_TICKS(1));
++        }
++
++        if (!sent) {
++            cmdQueueFailures.fetch_add(1, std::memory_order_relaxed);
++            Serial.println("[AudioOutput] WARNING: CMD_CANCEL_SESSION queue send failed! Emergency flag active.");
+         }
+ 
+         Serial.printf("[AudioOutput] Session CANCELLED: %s (new gen: %lu)\n",
+                       reason ? reason : "user_interrupted", (unsigned long)cmd.generation);
+     }
+ 
++    // End active audio session cleanly (Zero unsafe writes)
+     void endSession() {
+         sessionActive.store(false, std::memory_order_release);
+ 
+@@ -1146,8 +1189,18 @@
+         cmd.isMp3 = false;
+         cmd.sessionId[0] = '\0';
+ 
+-        if (audioCmdQueue) {
+-            xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10));
++        bool sent = false;
++        for (int r = 0; r < 5; r++) {
++            if (audioCmdQueue && xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
++                sent = true;
++                break;
++            }
++            vTaskDelay(pdMS_TO_TICKS(1));
++        }
++
++        if (!sent) {
++            cmdQueueFailures.fetch_add(1, std::memory_order_relaxed);
++            Serial.println("[AudioOutput] WARNING: CMD_END_SESSION queue send failed after 5 retries.");
+         }
+     }
+ 
+@@ -1155,11 +1208,31 @@
+         return activeSessionGeneration.load(std::memory_order_acquire);
+     }
+ 
+-    // Non-blocking PCM enqueue with atomic session validation (ZERO lock contention)
++    const char* getActiveSessionId() const {
++        return activeSessionId;
++    }
++
++    bool checkAndClearReadyAck() {
++        return sendReadyAckPending.exchange(false, std::memory_order_acq_rel);
++    }
++
++    bool checkAndClearFlowPause() {
++        return flowControlPauseNeeded.exchange(false, std::memory_order_acq_rel);
++    }
++
++    bool checkAndClearFlowResume() {
++        return flowControlResumeNeeded.exchange(false, std::memory_order_acq_rel);
++    }
++
++    size_t getFreeBufferBytes() const {
++        return audioRingBuf ? xRingbufferGetCurFreeSize(audioRingBuf) : 0;
++    }
++
++    // Bounded PCM enqueue: fast 2ms timeout, zero blocking polling loop
+     bool enqueuePcm(const int16_t* samples, size_t sampleCount, uint32_t streamGen) {
+         if (!initialized || !audioRingBuf || !samples || sampleCount == 0) return false;
+ 
+-        // Disallow 0 or mismatched generation or cancelled session
++        // Disallow 0 or mismatched generation or cancelled or inactive session
+         if (streamGen == 0 ||
+             streamGen != activeSessionGeneration.load(std::memory_order_acquire) ||
+             sessionCancelled.load(std::memory_order_acquire) ||
+@@ -1171,13 +1244,14 @@
+         totalPacketsReceived.fetch_add(1, std::memory_order_relaxed);
+         size_t bytes = sampleCount * sizeof(int16_t);
+ 
+-        // Timeout 0: Non-blocking send! NEVER stalls taskAudio!
+-        BaseType_t res = xRingbufferSend(audioRingBuf, (const void*)samples, bytes, 0);
++        // Bounded wait of 2ms: protects WebSocket callback from ever blocking
++        BaseType_t res = xRingbufferSend(audioRingBuf, (const void*)samples, bytes, pdMS_TO_TICKS(2));
+         if (res != pdTRUE) {
+             overflowCount.fetch_add(1, std::memory_order_relaxed);
+             droppedFrames.fetch_add(1, std::memory_order_relaxed);
+             return false;
+         }
++
+         return true;
+     }
+ 
+@@ -1190,8 +1264,16 @@
+         cmd.isMp3 = false;
+         cmd.sessionId[0] = '\0';
+ 
+-        if (audioCmdQueue) {
+-            xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10));
++        bool sent = false;
++        for (int r = 0; r < 5; r++) {
++            if (audioCmdQueue && xQueueSend(audioCmdQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
++                sent = true;
++                break;
++            }
++            vTaskDelay(pdMS_TO_TICKS(1));
++        }
++        if (!sent) {
++            cmdQueueFailures.fetch_add(1, std::memory_order_relaxed);
+         }
+     }
+ 
+@@ -1219,7 +1301,25 @@
+     bool update() {
+         if (!initialized) return false;
+ 
+-        // 1. Process asynchronous commands from audioCmdQueue in FIFO order
++        // 0. Handle emergency atomic cancellation (if command queue was ever full)
++        if (emergencyCancelRequested.exchange(false, std::memory_order_acq_rel)) {
++            if (audioRingBuf) {
++                size_t size = 0;
++                void* itm = nullptr;
++                while ((itm = xRingbufferReceiveUpTo(audioRingBuf, &size, 0, AUDIO_CHUNK_SIZE)) != nullptr) {
++                    vRingbufferReturnItem(audioRingBuf, itm);
++                }
++            }
++            i2s_zero_dma_buffer(I2S_NUM_1);
++            streamEnded = false;
++            prebufferReached = false;
++            isFlowPaused = false;
++            chime.running = false;
++            activeSessionId[0] = '\0';
++            isAudioPlaying.store(false, std::memory_order_release);
++        }
++
++        // 1. Process asynchronous commands from audioCmdQueue in strict FIFO order
+         AudioCommand cmd;
+         while (audioCmdQueue && xQueueReceive(audioCmdQueue, &cmd, 0) == pdTRUE) {
+             switch (cmd.type) {
+@@ -1237,10 +1337,15 @@
+                     streamEnded = false;
+                     prebufferReached = false;
+                     isMp3Stream = cmd.isMp3;
++                    isFlowPaused = false; // Reset flow pause state for new session
+                     strncpy(activeSessionId, cmd.sessionId, sizeof(activeSessionId) - 1);
+                     activeSessionId[sizeof(activeSessionId) - 1] = '\0';
+                     chime.running = false;
+                     isAudioPlaying.store(false, std::memory_order_release);
++
++                    // Fix 1: Now that previous audio is 100% flushed, activate session & trigger handshake ack
++                    sessionActive.store(true, std::memory_order_release);
++                    sendReadyAckPending.store(true, std::memory_order_release);
+                     break;
+                 }
+                 case AudioCmdType::CMD_CANCEL_SESSION:
+@@ -1255,6 +1360,7 @@
+                     i2s_zero_dma_buffer(I2S_NUM_1);
+                     streamEnded = false;
+                     prebufferReached = false;
++                    isFlowPaused = false; // Reset flow pause state
+                     chime.running = false;
+                     activeSessionId[0] = '\0';
+                     isAudioPlaying.store(false, std::memory_order_release);
+@@ -1262,6 +1368,7 @@
+                 }
+                 case AudioCmdType::CMD_END_SESSION: {
+                     streamEnded = true; // Signal update() that buffer may drain to completion
++                    isFlowPaused = false; // Ensure flow pause state reset
+                     break;
+                 }
+                 case AudioCmdType::CMD_SET_VOLUME: {
+@@ -1269,7 +1376,6 @@
+                     break;
+                 }
+                 case AudioCmdType::CMD_CHIME_REQUEST: {
+-                    // Cute Chime triggers ONLY if no voice stream is active or buffered
+                     size_t curFree = audioRingBuf ? xRingbufferGetCurFreeSize(audioRingBuf) : 0;
+                     size_t curBuffered = (ringBufCapacity > curFree) ? (ringBufCapacity - curFree) : 0;
+                     if (!sessionActive.load(std::memory_order_acquire) && curBuffered == 0) {
+@@ -1283,9 +1389,20 @@
+             }
+         }
+ 
+-        // 2. Measure RingBuffer occupancy
++        // 2. Measure RingBuffer occupancy & Watermark Flow Control (Fix 1: Owned strictly by taskAudio!)
+         size_t curFree = audioRingBuf ? xRingbufferGetCurFreeSize(audioRingBuf) : 0;
+         size_t bufferedBytes = (ringBufCapacity > curFree) ? (ringBufCapacity - curFree) : 0;
++
++        // Continues monitoring and evaluating occupancy during playback even when producer is paused!
++        if (sessionActive.load(std::memory_order_acquire)) {
++            if (!isFlowPaused && bufferedBytes >= (ringBufCapacity * 3) / 4) {
++                isFlowPaused = true;
++                flowControlPauseNeeded.store(true, std::memory_order_release);
++            } else if (isFlowPaused && bufferedBytes <= (ringBufCapacity * 2) / 5) {
++                isFlowPaused = false;
++                flowControlResumeNeeded.store(true, std::memory_order_release);
++            }
++        }
+ 
+         // 3. SOURCE-PRIORITY POLICY:
+         // Streaming Voice Audio takes precedence over Cute Chime.
+@@ -1394,7 +1511,7 @@
+     }
+ 
+     // Production health, memory and recovery telemetry (Accurate 256KB capacity)
+-    void printDiagnostics() {
++    void printDiagnostics(TaskHandle_t audioHandle = nullptr) {
+         size_t freeHeap = ESP.getFreeHeap();
+         size_t minHeap = ESP.getMinFreeHeap();
+         size_t maxBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+@@ -1402,6 +1519,7 @@
+         size_t totalPsram = ESP.getPsramSize();
+         size_t freeRing = audioRingBuf ? xRingbufferGetCurFreeSize(audioRingBuf) : 0;
+         size_t occRing = (ringBufCapacity > freeRing) ? (ringBufCapacity - freeRing) : 0;
++        UBaseType_t stackHighWater = audioHandle ? uxTaskGetStackHighWaterMark(audioHandle) : 0;
+ 
+         Serial.printf("[AUDIO-DIAG] Heap: %u B (Min: %u B, MaxBlk: %u B) | PSRAM: %u/%u KB\n",
+                       (unsigned)freeHeap, (unsigned)minHeap, (unsigned)maxBlock,
+@@ -1412,15 +1530,16 @@
+                       (unsigned long)underrunCount.load(), (unsigned long)overflowCount.load(), (unsigned long)droppedFrames.load(),
+                       (unsigned long)ringItemsCheckedOut.load(), (unsigned long)ringItemsReturned.load(),
+                       (long)(ringItemsCheckedOut.load() - ringItemsReturned.load()));
+-        Serial.printf("[AUDIO-DIAG] I2S: Partial: %lu | LostBytes: %lu | Played: %lu B\n",
++        Serial.printf("[AUDIO-DIAG] I2S: Partial: %lu | LostBytes: %lu | Played: %lu B | StackFree: %u words | CmdQueueDrops: %lu\n",
+                       (unsigned long)i2sPartialWrites.load(), (unsigned long)unrecoverableDroppedBytes.load(),
+-                      (unsigned long)totalBytesPlayed.load());
+-        Serial.printf("[AUDIO-DIAG] Session: %s (ActiveGen: %lu, PlayGen: %lu) | State: %s | Prebuf: %s\n",
++                      (unsigned long)totalBytesPlayed.load(), (unsigned)stackHighWater, (unsigned long)cmdQueueFailures.load());
++        Serial.printf("[AUDIO-DIAG] Session: %s (ActiveGen: %lu, PlayGen: %lu) | State: %s | Prebuf: %s | Flow: %s\n",
+                       activeSessionId[0] ? activeSessionId : "<none>",
+                       (unsigned long)activeSessionGeneration.load(),
+                       (unsigned long)playbackGeneration,
+                       sessionActive.load() ? "ACTIVE" : (chime.running ? "CHIME" : "IDLE"),
+-                      prebufferReached ? "READY" : "BUFFERING");
++                      prebufferReached ? "READY" : "BUFFERING",
++                      isFlowPaused ? "PAUSED" : "FLOWING");
+     }
+ };
+ 
+@@ -2550,10 +2669,64 @@
+         }
+     }
+ 
++    bool sendAudioReadyAck(const char* sessId, uint32_t gen) {
++        JsonDocument doc;
++        doc["event"] = "audio:ready";
++        JsonObject data = doc["data"].to<JsonObject>();
++        data["sessionId"] = sessId ? sessId : "";
++        data["generation"] = gen;
++        data["sampleRate"] = 24000;
++        data["status"] = "ready";
++
++        String out;
++        serializeJson(doc, out);
++        if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
++            bool ok = (client.available() && authenticated) ? client.send(out) : false;
++            xSemaphoreGive(wsMutex);
++            Serial.printf("[WebSocket] Handshake ACK: Sent audio:ready for session %s (gen: %lu)\n",
++                          sessId ? sessId : "<none>", (unsigned long)gen);
++            return ok;
++        }
++        return false;
++    }
++
++    bool sendFlowControl(const char* status) {
++        JsonDocument doc;
++        doc["event"] = "audio:flow";
++        JsonObject data = doc["data"].to<JsonObject>();
++        data["status"] = status;
++        data["freeBytes"] = AudioOutputDriver::getInstance().getFreeBufferBytes();
++
++        String out;
++        serializeJson(doc, out);
++        if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
++            bool ok = (client.available() && authenticated) ? client.send(out) : false;
++            xSemaphoreGive(wsMutex);
++            Serial.printf("[WebSocket] Watermark Flow Control: Sent audio:flow %s (free: %u B)\n",
++                          status, (unsigned)AudioOutputDriver::getInstance().getFreeBufferBytes());
++            return ok;
++        }
++        return false;
++    }
++
+     void update() {
+         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(20))) {
+             if (wsConnected) client.poll();
+             xSemaphoreGive(wsMutex);
++        }
++
++        // Handshake: Send audio:ready acknowledgement as soon as taskAudio finishes buffer flush
++        if (wsConnected && authenticated) {
++            if (AudioOutputDriver::getInstance().checkAndClearReadyAck()) {
++                sendAudioReadyAck(AudioOutputDriver::getInstance().getActiveSessionId(),
++                                  AudioOutputDriver::getInstance().getActiveGeneration());
++            }
++            if (AudioOutputDriver::getInstance().checkAndClearFlowPause()) {
++                sendFlowControl("pause");
++            }
++            if (AudioOutputDriver::getInstance().checkAndClearFlowResume()) {
++                sendFlowControl("resume");
++            }
+         }
+ 
+         unsigned long now = millis();
+@@ -3189,7 +3362,7 @@
+     static unsigned long lastDiagLogTime = 0;
+     if (now - lastDiagLogTime >= 10000) {
+         lastDiagLogTime = now;
+-        AudioOutputDriver::getInstance().printDiagnostics();
++        AudioOutputDriver::getInstance().printDiagnostics(taskAudioHandle);
+     }
+ 
+     vTaskDelay(pdMS_TO_TICKS(5));

@@ -178,7 +178,7 @@ static MemoDebugConsole MemoConsole;
 #define AUDIO_DMA_BUF_COUNT      8
 #define AUDIO_DMA_BUF_LEN        512
 #define AUDIO_CHUNK_SIZE         1024
-#define AUDIO_RING_BUFFER_BYTES_PSRAM  (256 * 1024) // 256 KB in Octal PSRAM (~5.5 sec continuous 24kHz audio)
+#define AUDIO_RING_BUFFER_BYTES_PSRAM  (384 * 1024) // 384 KiB in Octal PSRAM (~8.2 sec of 24kHz mono PCM)
 #define AUDIO_RING_BUFFER_BYTES_SRAM   32768        // 32 KB fallback in internal SRAM
 #define DEFAULT_VOLUME           80
 #define DEFAULT_BRIGHTNESS       80
@@ -407,11 +407,13 @@ enum class ActiveScreen {
     SCREEN_RFID
 };
 
+enum class WakePrompt : uint8_t { None, Speak, Offline };
+static std::atomic<WakePrompt> wakePrompt{WakePrompt::None};
+
 enum class EventType {
     NONE,
     TOUCH_SENSOR_PRESS,
     TOUCH_SENSOR_RELEASE,
-    TOUCH_SENSOR_LONG_PRESS,
     BUTTON_VOL_UP,
     BUTTON_VOL_DOWN,
     VOICE_SESSION_START,
@@ -436,6 +438,16 @@ struct AppEvent {
 };
 
 QueueHandle_t appEventQueue = nullptr;
+
+struct RfidDisplayResult {
+    char uid[32];
+    char itemKey[24];
+    char nameEn[96];
+    bool found;
+    unsigned long receivedAt;
+};
+QueueHandle_t rfidDisplayQueue = nullptr;
+QueueHandle_t rfidLookupQueue = nullptr;
 
 void postEvent(EventType type, int intValue = 0, const char* str = nullptr) {
     if (!appEventQueue) return;
@@ -862,7 +874,8 @@ enum class AudioCmdType : uint8_t {
     CMD_END_SESSION,
     CMD_FLUSH,
     CMD_SET_VOLUME,
-    CMD_CHIME_REQUEST
+    CMD_CHIME_REQUEST,
+    CMD_SPEAKER_TEST
 };
 
 struct AudioCommand {
@@ -871,7 +884,8 @@ struct AudioCommand {
     uint32_t sampleRate;
     uint8_t volume;
     bool isMp3;
-    char sessionId[32];
+    uint16_t initialBufferMs;
+    char sessionId[64];
 };
 
 class AudioOutputDriver {
@@ -882,7 +896,7 @@ private:
     // Asynchronous command queue for serialized lifecycle management
     QueueHandle_t audioCmdQueue = nullptr;
 
-    // FreeRTOS RingBuffer for rolling PCM audio streaming (256KB in PSRAM)
+    // FreeRTOS RingBuffer for rolling PCM audio streaming
     RingbufHandle_t audioRingBuf = nullptr;
     size_t ringBufCapacity = 0;
 
@@ -899,13 +913,15 @@ private:
 
     // Internal playback state owned EXCLUSIVELY by taskAudio on Core 1:
     float gainMultiplier = 0.8f;
-    int16_t scaleBuffer[AUDIO_CHUNK_SIZE / 2];
+    int16_t scaleBuffer[AUDIO_CHUNK_SIZE];
     bool streamEnded = false;
     bool isMp3Stream = false;
     bool prebufferReached = false;
+    bool recoveringUnderrun = false;
+    uint16_t initialBufferOverrideMs = 0;
     bool isFlowPaused = false; // Watermark state owned strictly by taskAudio
     uint32_t playbackGeneration = 0;
-    char activeSessionId[32] = {0};
+    char activeSessionId[64] = {0};
     unsigned long lastPlayingTime = 0;
 
     // Non-blocking Cute Chime synthesizer state machine (Owned solely by taskAudio)
@@ -926,7 +942,7 @@ private:
     std::atomic<uint32_t> cmdQueueFailures{0};
     std::atomic<uint32_t> ringItemsCheckedOut{0};
     std::atomic<uint32_t> ringItemsReturned{0};
-    std::atomic<uint32_t> totalPacketsReceived{0};
+    std::atomic<uint32_t> totalPcmBytesReceived{0};
     std::atomic<uint32_t> totalBytesPlayed{0};
 
     // Robust I2S write recovery: strictly bounded global attempts and elapsed time, sample-aligned
@@ -984,7 +1000,7 @@ private:
             Serial.printf("[AudioOutput] WARNING: I2S write incomplete. Lost %u bytes (total lost: %lu)\n",
                           (unsigned)bytesRemaining, (unsigned long)unrecoverableDroppedBytes.load());
         }
-        totalBytesPlayed.fetch_add(totalWritten, std::memory_order_relaxed);
+        totalBytesPlayed.fetch_add(totalWritten / 2, std::memory_order_relaxed);
         return totalWritten;
     }
 
@@ -1010,11 +1026,11 @@ public:
             .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
             .sample_rate = AUDIO_OUT_SAMPLE_RATE, // Enforce 24kHz hardware rate
             .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-            .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+            .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
             .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
             .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-            .dma_buf_count = AUDIO_DMA_BUF_COUNT,
-            .dma_buf_len = AUDIO_DMA_BUF_LEN,
+            .dma_buf_count = 4,
+            .dma_buf_len = 128,
             .use_apll = false,
             .tx_desc_auto_clear = true,
             .fixed_mclk = 0
@@ -1049,7 +1065,7 @@ public:
                 audioRingBuf = xRingbufferCreateWithCaps(AUDIO_RING_BUFFER_BYTES_PSRAM, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                 if (audioRingBuf) {
                     ringBufCapacity = AUDIO_RING_BUFFER_BYTES_PSRAM;
-                    Serial.printf("[AudioOutput] Allocated 256 KB (262,144 B) RingBuffer in Octal PSRAM.\n");
+                    Serial.printf("[AudioOutput] Allocated %u B RingBuffer in Octal PSRAM.\n", (unsigned)ringBufCapacity);
                 } else {
                     Serial.println("[AudioOutput] WARNING: PSRAM allocation failed! Falling back to SRAM...");
                 }
@@ -1115,7 +1131,7 @@ public:
     }
 
     // Start a new audio session with strict 24kHz validation & handshake initiation
-    uint32_t startSession(const char* sessionId, uint32_t sRate = 24000, bool isMp3 = false) {
+    uint32_t startSession(const char* sessionId, uint32_t sRate = 24000, bool isMp3 = false, uint16_t initialBufferMs = 0) {
         // Fix 4: Strictly reject non-24kHz incoming audio metadata
         if (sRate != 0 && sRate != AUDIO_OUT_SAMPLE_RATE) {
             Serial.printf("[AudioOutput] ERROR: Rejected stream. Unsupported sample rate %lu Hz. Hardware is strictly %u Hz!\n",
@@ -1138,6 +1154,7 @@ public:
         cmd.sampleRate = sRate;
         cmd.volume = 0;
         cmd.isMp3 = isMp3;
+        cmd.initialBufferMs = initialBufferMs;
         if (sessionId) {
             strncpy(cmd.sessionId, sessionId, sizeof(cmd.sessionId) - 1);
             cmd.sessionId[sizeof(cmd.sessionId) - 1] = '\0';
@@ -1260,12 +1277,14 @@ public:
         flowControlResumeNeeded.store(false, std::memory_order_release);
     }
 
+    bool hasPsramAudioBuffer() const { return ringBufCapacity == AUDIO_RING_BUFFER_BYTES_PSRAM; }
+
     size_t getFreeBufferBytes() const {
         return audioRingBuf ? xRingbufferGetCurFreeSize(audioRingBuf) : 0;
     }
 
     // Bounded PCM enqueue: fast 2ms timeout, zero blocking polling loop
-    bool enqueuePcm(const int16_t* samples, size_t sampleCount, uint32_t streamGen) {
+    bool enqueuePcm(const void* samples, size_t sampleCount, uint32_t streamGen) {
         if (!initialized || !audioRingBuf || !samples || sampleCount == 0) return false;
 
         // Disallow 0 or mismatched generation or cancelled or inactive session
@@ -1277,23 +1296,23 @@ public:
             return false;
         }
 
-        totalPacketsReceived.fetch_add(1, std::memory_order_relaxed);
         size_t bytes = sampleCount * sizeof(int16_t);
 
         // Bounded wait of 2ms: protects WebSocket callback from ever blocking
-        BaseType_t res = xRingbufferSend(audioRingBuf, (const void*)samples, bytes, pdMS_TO_TICKS(2));
+        BaseType_t res = xRingbufferSend(audioRingBuf, samples, bytes, pdMS_TO_TICKS(2));
         if (res != pdTRUE) {
             overflowCount.fetch_add(1, std::memory_order_relaxed);
             droppedFrames.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
+        totalPcmBytesReceived.fetch_add(bytes, std::memory_order_relaxed);
         return true;
     }
 
-    void triggerCuteChime() {
+    void triggerCuteChime(bool speakerTest = false) {
         AudioCommand cmd;
-        cmd.type = AudioCmdType::CMD_CHIME_REQUEST;
+        cmd.type = speakerTest ? AudioCmdType::CMD_SPEAKER_TEST : AudioCmdType::CMD_CHIME_REQUEST;
         cmd.generation = 0;
         cmd.sampleRate = 0;
         cmd.volume = 0;
@@ -1317,6 +1336,8 @@ public:
     void stopAndFlush() {
         cancelSession("flush_stop");
     }
+
+    bool isSessionActive() const { return sessionActive.load(std::memory_order_acquire); }
 
     // Thread-safe check if buffered audio or DMA is active
     bool hasBufferedAudio() const {
@@ -1369,10 +1390,12 @@ public:
                         }
                     }
                     i2s_zero_dma_buffer(I2S_NUM_1);
+                    recoveringUnderrun = false;
                     playbackGeneration = cmd.generation;
                     streamEnded = false;
                     prebufferReached = false;
                     isMp3Stream = cmd.isMp3;
+                    initialBufferOverrideMs = cmd.initialBufferMs;
                     isFlowPaused = false; // Reset flow pause state for new session
                     strncpy(activeSessionId, cmd.sessionId, sizeof(activeSessionId) - 1);
                     activeSessionId[sizeof(activeSessionId) - 1] = '\0';
@@ -1411,13 +1434,16 @@ public:
                     gainMultiplier = ((float)cmd.volume / 100.0f) * 0.95f;
                     break;
                 }
-                case AudioCmdType::CMD_CHIME_REQUEST: {
+                case AudioCmdType::CMD_CHIME_REQUEST:
+                case AudioCmdType::CMD_SPEAKER_TEST: {
                     size_t curFree = audioRingBuf ? xRingbufferGetCurFreeSize(audioRingBuf) : 0;
                     size_t curBuffered = (ringBufCapacity > curFree) ? (ringBufCapacity - curFree) : 0;
                     if (!sessionActive.load(std::memory_order_acquire) && curBuffered == 0) {
                         chime.running = true;
                         chime.currentSample = 0;
-                        chime.totalSamples = (AUDIO_OUT_SAMPLE_RATE * 650) / 1000;
+                        chime.totalSamples = cmd.type == AudioCmdType::CMD_SPEAKER_TEST
+                            ? AUDIO_OUT_SAMPLE_RATE * 3
+                            : (AUDIO_OUT_SAMPLE_RATE * 650) / 1000;
                         chime.phase = 0.0f;
                     }
                     break;
@@ -1429,12 +1455,14 @@ public:
         size_t curFree = audioRingBuf ? xRingbufferGetCurFreeSize(audioRingBuf) : 0;
         size_t bufferedBytes = (ringBufCapacity > curFree) ? (ringBufCapacity - curFree) : 0;
 
-        // Continues monitoring and evaluating occupancy during playback even when producer is paused!
+        // Keep a larger reserve for library tracks while continuing to play locally.
+        const bool libraryTrack = strncmp(activeSessionId, "playback_", 9) == 0;
+        const size_t resumePercent = libraryTrack && ringBufCapacity == AUDIO_RING_BUFFER_BYTES_PSRAM ? 55 : 40;
         if (sessionActive.load(std::memory_order_acquire)) {
             if (!isFlowPaused && bufferedBytes >= (ringBufCapacity * 3) / 4) {
                 isFlowPaused = true;
                 flowControlPauseNeeded.store(true, std::memory_order_release);
-            } else if (isFlowPaused && bufferedBytes <= (ringBufCapacity * 2) / 5) {
+            } else if (isFlowPaused && bufferedBytes <= (ringBufCapacity * resumePercent) / 100) {
                 isFlowPaused = false;
                 flowControlResumeNeeded.store(true, std::memory_order_release);
             }
@@ -1447,14 +1475,14 @@ public:
             chime.running = false; // Gracefully yield to speech
         }
 
-        // 4. Prebuffer Threshold Management:
-        // Gemini Live voice: ~150ms = 7,200 bytes (24kHz 16-bit mono = 48,000 B/s)
-        // Website MP3 stream: ~400ms = 19,200 bytes
-        if (!prebufferReached) {
-            size_t threshold = isMp3Stream ? 19200 : 7200;
-            if (bufferedBytes >= threshold || streamEnded) {
-                prebufferReached = true;
-            }
+        // Let voice recover from a brief network gap without a long pause mid-sentence.
+        if (!prebufferReached && ringBufCapacity) {
+            constexpr size_t pcmBytesPerMs = AUDIO_OUT_SAMPLE_RATE * sizeof(int16_t) / 1000;
+            const size_t initialMs = initialBufferOverrideMs ? initialBufferOverrideMs : (libraryTrack ? 900 : 1000);
+            const size_t recoveryMs = libraryTrack ? 950 : 1200;
+            const size_t target = std::min((recoveringUnderrun ? recoveryMs : initialMs) * pcmBytesPerMs,
+                                           ringBufCapacity / 2);
+            if (bufferedBytes >= target || streamEnded) prebufferReached = true;
         }
 
         // 5. Stream audio from RingBuffer to I2S (High-Priority Path with Guaranteed Item Return)
@@ -1481,10 +1509,10 @@ public:
                             int32_t val = (int32_t)(pcmIn[i] * gainMultiplier);
                             if (val > 30000) val = 30000;
                             if (val < -30000) val = -30000;
-                            scaleBuffer[i] = (int16_t)val;
+                            scaleBuffer[2*i] = scaleBuffer[2*i + 1] = (int16_t)val;
                         }
 
-                        writeI2sWithRetry((const uint8_t*)scaleBuffer, samples * sizeof(int16_t));
+                        writeI2sWithRetry((const uint8_t*)scaleBuffer, 2 * samples * sizeof(int16_t));
                     }
                 }
 
@@ -1495,17 +1523,13 @@ public:
                 ringItemsReturned.fetch_add(1, std::memory_order_relaxed);
 
                 return true;
-            } else {
-                if (isAudioPlaying.load(std::memory_order_acquire) && (millis() - lastPlayingTime > 80)) {
-                    isAudioPlaying.store(false, std::memory_order_release);
-                    if (sessionActive.load(std::memory_order_acquire) && !streamEnded) {
-                        underrunCount.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
             }
-        } else {
-            if (isAudioPlaying.load(std::memory_order_acquire) && (millis() - lastPlayingTime > 80)) {
-                isAudioPlaying.store(false, std::memory_order_release);
+        } else if (isAudioPlaying.load(std::memory_order_acquire) && millis() - lastPlayingTime > 35) {
+            isAudioPlaying.store(false, std::memory_order_release);
+            if (prebufferReached && !streamEnded && sessionActive.load(std::memory_order_acquire)) {
+                underrunCount.fetch_add(1, std::memory_order_relaxed);
+                recoveringUnderrun = true;
+                prebufferReached = false;
             }
         }
 
@@ -1530,14 +1554,14 @@ public:
                 if (chime.phase >= 2.0f * PI) chime.phase -= 2.0f * PI;
 
                 float sample = (sinf(chime.phase) + 0.3f * sinf(2.0f * chime.phase)) * env * 18000.0f * ((float)currentVolume.load(std::memory_order_relaxed) / 100.0f);
-                scaleBuffer[b] = (int16_t)sample;
+                scaleBuffer[2*b] = scaleBuffer[2*b + 1] = (int16_t)sample;
             }
             chime.currentSample += batch;
             if (chime.currentSample >= chime.totalSamples) {
                 chime.running = false;
             }
 
-            writeI2sWithRetry((const uint8_t*)scaleBuffer, batch * sizeof(int16_t), 3, 30);
+            writeI2sWithRetry((const uint8_t*)scaleBuffer, 2 * batch * sizeof(int16_t), 3, 30);
             isAudioPlaying.store(true, std::memory_order_release);
             lastPlayingTime = millis();
             return true;
@@ -1546,7 +1570,7 @@ public:
         return hasData;
     }
 
-    // Production health, memory and recovery telemetry (Accurate 256KB capacity)
+    // Production health, memory and recovery telemetry
     void printDiagnostics(TaskHandle_t audioHandle = nullptr) {
         size_t freeHeap = ESP.getFreeHeap();
         size_t minHeap = ESP.getMinFreeHeap();
@@ -1569,6 +1593,21 @@ public:
         Serial.printf("[AUDIO-DIAG] I2S: Partial: %lu | LostBytes: %lu | Played: %lu B | StackFree: %u words | CmdQueueDrops: %lu\n",
                       (unsigned long)i2sPartialWrites.load(), (unsigned long)unrecoverableDroppedBytes.load(),
                       (unsigned long)totalBytesPlayed.load(), (unsigned)stackHighWater, (unsigned long)cmdQueueFailures.load());
+        const unsigned long now = millis();
+        const uint32_t received = totalPcmBytesReceived.load(std::memory_order_relaxed);
+        const uint32_t played = totalBytesPlayed.load(std::memory_order_relaxed);
+        static unsigned long previousTime = 0;
+        static uint32_t previousReceived = 0, previousPlayed = 0;
+        if (previousTime && now != previousTime) {
+            const unsigned long interval = now - previousTime;
+            Serial.printf("[AUDIO-DIAG] Avg over %lu ms: RX %lu B/s | I2S %lu B/s | WriteErrors %lu\n",
+                          interval, (unsigned long)((uint64_t)(received - previousReceived) * 1000 / interval),
+                          (unsigned long)((uint64_t)(played - previousPlayed) * 1000 / interval),
+                          (unsigned long)i2sWriteErrors.load());
+        }
+        previousTime = now;
+        previousReceived = received;
+        previousPlayed = played;
         Serial.printf("[AUDIO-DIAG] Session: %s (ActiveGen: %lu, PlayGen: %lu) | State: %s | Prebuf: %s | Flow: %s\n",
                       activeSessionId[0] ? activeSessionId : "<none>",
                       (unsigned long)activeSessionGeneration.load(),
@@ -1586,7 +1625,8 @@ class AudioInputDriver {
 private:
     bool initialized = false;
     volatile bool capturing = false;
-    int32_t rawDmaBuffer[AUDIO_CHUNK_SIZE / 2];
+    int32_t rawDmaBuffer[AUDIO_CHUNK_SIZE];
+    unsigned micSlot = 0;
 
 public:
     static AudioInputDriver& getInstance() {
@@ -1601,7 +1641,7 @@ public:
             .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
             .sample_rate = AUDIO_IN_SAMPLE_RATE,
             .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-            .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+            .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
             .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
             .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
             .dma_buf_count = AUDIO_DMA_BUF_COUNT,
@@ -1652,12 +1692,30 @@ public:
         if (!initialized || !outBuf) return 0;
 
         size_t bytesRead = 0;
-        esp_err_t err = i2s_read(I2S_NUM_0, rawDmaBuffer, maxSamples * sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(40));
+        esp_err_t err = i2s_read(I2S_NUM_0, rawDmaBuffer, 2 * std::min<size_t>(maxSamples, AUDIO_CHUNK_SIZE / 2) * sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(40));
         if (err != ESP_OK || bytesRead == 0) return 0;
 
-        size_t samples = bytesRead / sizeof(int32_t);
+        size_t samples = bytesRead / (2 * sizeof(int32_t));
+        if (samples == 0) return 0;
+        // INMP441 drives one slot according to its L/R strap. Ignore DC on the unused slot.
+        int32_t low[2] = {32767, 32767}, high[2] = {-32768, -32768};
+        for (size_t i = 0; i < samples; ++i) {
+            for (unsigned slot = 0; slot < 2; ++slot) {
+                const int32_t value = rawDmaBuffer[2*i + slot] >> 16;
+                low[slot] = std::min(low[slot], value);
+                high[slot] = std::max(high[slot], value);
+            }
+        }
+        const unsigned other = 1 - micSlot;
+        const int32_t otherRange = high[other] - low[other];
+        if (otherRange > 16 && otherRange > 4 * (high[micSlot] - low[micSlot])) micSlot = other;
+        static unsigned long lastMicReport = 0;
+        if (millis() - lastMicReport >= 5000) {
+            Serial.printf("[Mic] slot=%u p-p=%ld/%ld\n", micSlot, (long)(high[0]-low[0]), (long)(high[1]-low[1]));
+            lastMicReport = millis();
+        }
         for (size_t i = 0; i < samples; i++) {
-            int32_t s = rawDmaBuffer[i] >> 14;
+            int32_t s = rawDmaBuffer[2*i + micSlot] >> 14;
             if (s > 32767) s = 32767;
             if (s < -32768) s = -32768;
             outBuf[i] = (int16_t)s;
@@ -1708,6 +1766,7 @@ private:
     // Neural network sample accumulator
     int16_t accumBuffer[1024] = {0};
     size_t accumCount = 0;
+    std::atomic<bool> resetAccum{false};
 
     unsigned long lastDetectionTime = 0;
     uint32_t totalDetections = 0;
@@ -1748,7 +1807,7 @@ public:
                 chunkSampleSize = wakenetIface->get_samp_chunksize(modelData);
                 char* word = wakenetIface->get_word_name(modelData, 1);
                 if (word) activeWakeWord = word;
-                wakenetIface->set_det_threshold(modelData, 0.65f, 1);
+                // Keep the detection threshold calibrated for this model.
 
                 modelLoaded = true;
                 status = WakeNetStatus::READY_ACTIVE_LISTENING;
@@ -1767,8 +1826,8 @@ public:
     }
 
     void setListening(bool listening) {
+        resetAccum.store(true, std::memory_order_release);
         activeListening.store(listening, std::memory_order_release);
-        accumCount = 0;
         if (listening) {
             Serial.println("[WakeWord] State: IDLE_LISTEN (re-armed)");
         } else {
@@ -1778,6 +1837,7 @@ public:
 
     bool isListening() const { return activeListening.load(std::memory_order_acquire); }
     bool isModelLoaded() const { return modelLoaded; }
+    void preservePreRoll() { validPreRoll = true; }
     bool hasPreRoll() const { return validPreRoll; }
     WakeNetStatus getStatus() const { return status; }
     const char* getActiveWakeWord() const { return activeWakeWord; }
@@ -1795,16 +1855,23 @@ public:
         return count;
     }
 
-    bool processPcmChunk(const int16_t* pcmSamples, size_t sampleCount) {
-        if (!activeListening.load(std::memory_order_acquire) || !modelLoaded || !modelData || !wakenetIface || !pcmSamples || sampleCount == 0) {
-            return false;
-        }
-
+    void remember(const int16_t* pcmSamples, size_t sampleCount) {
         // 1. Maintain rolling circular pre-roll buffer
         for (size_t i = 0; i < sampleCount; i++) {
             preRollBuffer[preRollHead] = pcmSamples[i];
             preRollHead = (preRollHead + 1) % PRE_ROLL_SAMPLES;
         }
+
+    }
+
+    bool processPcmChunk(const int16_t* pcmSamples, size_t sampleCount) {
+        if (!activeListening.load(std::memory_order_acquire) || !modelLoaded || !modelData || !wakenetIface || !pcmSamples || sampleCount == 0) {
+            return false;
+        }
+
+        if (resetAccum.exchange(false)) accumCount = 0;
+
+        remember(pcmSamples, sampleCount);
 
         // 2. Feed samples to WakeNet neural inference engine
         size_t offset = 0;
@@ -1821,15 +1888,16 @@ public:
                 accumCount = 0;
 
                 unsigned long now = millis();
-                if (result == WAKENET_DETECTED && (now - lastDetectionTime > WAKE_DETECTION_COOLDOWN_MS)) {
+                if (result == WAKENET_DETECTED && ((!totalDetections || now - lastDetectionTime >= WAKE_DETECTION_COOLDOWN_MS))) {
                     lastDetectionTime = now;
                     totalDetections++;
-                    validPreRoll = true;
+                    validPreRoll = false;
+                    memset(preRollBuffer, 0, sizeof(preRollBuffer));
+                    preRollHead = 0;
                     activeListening.store(false, std::memory_order_release);
                     status = WakeNetStatus::WAKE_DETECTED;
 
-                    Serial.printf("[WakeWord] DETECTED: \"%s\"! Launching Gemini Voice Session...\n", activeWakeWord);
-                    postEvent(EventType::VOICE_SESSION_START);
+                    Serial.printf("[WakeWord] DETECTED: \"%s\"!\n", activeWakeWord);
                     return true;
                 }
             }
@@ -2021,10 +2089,7 @@ public:
                 lastReconnectAttempt = now;
                 Serial.printf("[WiFi] Connection attempt %u timed out (8s limit).\n", failedAttempts);
 
-                if (failedAttempts >= 2) {
-                    Serial.println("[WiFi] Rapid fallback: Starting SoftAP Provisioning Portal ('ESP32-Robot-Setup')...");
-                    startProvisioningPortal();
-                }
+
             }
         } else if (state == WifiState::CONNECTED) {
             if (WiFi.status() != WL_CONNECTED) {
@@ -2076,13 +2141,20 @@ private:
     unsigned long lastStatusBarDraw = 0;
     String lastRfidScanned = "";
 
+    static constexpr unsigned long RFID_CACHE_TTL_MS = 5 * 60 * 1000;
+    RfidDisplayResult rfidCache[8]{};
+    size_t nextRfidCacheSlot = 0;
+
+    enum class RfidLookupState { Pending, Ready, Unavailable };
     struct RfidCardView {
         bool active = false;
         String uid = "";
         bool found = false;
         String itemKey = "";
         String nameEn = "";
-        String nameMm = "";
+        RfidLookupState lookup = RfidLookupState::Ready;
+        unsigned long scannedAt = 0;
+        bool logDraw = false;
         unsigned long displayStartTime = 0;
     } rfidCardView;
 
@@ -2103,16 +2175,46 @@ public:
         lastRfidScanned = uid;
     }
 
-    void showRfidResult(const String& uid, bool found, const String& itemKey, const String& nameEn, const String& nameMm) {
+    void showRfidScan(const char* uid, unsigned long scannedAt, bool lookupQueued) {
         rfidCardView.active = true;
         rfidCardView.uid = uid;
-        rfidCardView.found = found;
-        rfidCardView.itemKey = itemKey;
-        rfidCardView.nameEn = nameEn;
-        rfidCardView.nameMm = nameMm;
+        rfidCardView.lookup = lookupQueued ? RfidLookupState::Pending : RfidLookupState::Unavailable;
+        rfidCardView.scannedAt = scannedAt;
         rfidCardView.displayStartTime = millis();
+        rfidCardView.logDraw = false;
         lastRfidScanned = uid;
+        for (const auto& cached : rfidCache) {
+            if (cached.found && rfidCardView.uid == cached.uid &&
+                millis() - cached.receivedAt < RFID_CACHE_TTL_MS) {
+                applyRfidResult(cached, rfidCardView.displayStartTime);
+                Serial.printf("[RFID] Cache hit uid=%s\n", uid);
+                break;
+            }
+        }
         setScreen(ActiveScreen::SCREEN_RFID);
+    }
+
+    void applyRfidResult(const RfidDisplayResult& result, unsigned long now) {
+        rfidCardView.lookup = RfidLookupState::Ready;
+        rfidCardView.found = result.found;
+        rfidCardView.itemKey = result.itemKey;
+        rfidCardView.nameEn = result.nameEn;
+        rfidCardView.displayStartTime = now;
+        rfidCardView.logDraw = true;
+        forceRedraw = true;
+    }
+
+    void rememberRfidResult(const RfidDisplayResult& result) {
+        for (auto& cached : rfidCache) {
+            if (strcmp(cached.uid, result.uid) == 0) {
+                cached = result;
+                return;
+            }
+        }
+        if (result.found) {
+            rfidCache[nextRfidCacheSlot] = result;
+            nextRfidCacheSlot = (nextRfidCacheSlot + 1) % (sizeof(rfidCache) / sizeof(rfidCache[0]));
+        }
     }
 
     void drawVectorGraphic(const String& item, int cx, int cy) {
@@ -2192,15 +2294,81 @@ public:
             tft.fillCircle(cx + 9, cy - 4, 4, TFT_BLACK);
             tft.fillCircle(cx + 10, cy - 5, 1, TFT_WHITE);
         } else if (item == "banana") {
-            uint16_t cYellow = tft.color565(255, 225, 30);
-            uint16_t cDarkYellow = tft.color565(220, 180, 20);
-            uint16_t cStem = tft.color565(110, 75, 25);
-            // Banana crescent
-            tft.fillCircle(cx - 6, cy + 4, 22, cYellow);
-            tft.fillCircle(cx - 16, cy - 6, 18, tft.color565(25, 38, 65));
-            tft.fillRoundRect(cx - 20, cy - 22, 10, 16, 4, cStem);
-            tft.fillRoundRect(cx + 14, cy + 16, 8, 8, 3, cDarkYellow);
-            tft.drawFastHLine(cx - 4, cy + 8, 16, cDarkYellow);
+            uint16_t cYellow = tft.color565(255, 215, 0);     // Vibrant banana yellow
+            uint16_t cDarkYellow = tft.color565(210, 160, 20); // Banana shading / peel ridge
+            uint16_t cStem = tft.color565(100, 130, 40);      // Green-brown stem
+            uint16_t cTip = tft.color565(80, 50, 20);         // Dark tip
+            
+            // Realistic curved banana peel body (tilted smoothly from top-left to right)
+            tft.fillCircle(cx - 16, cy - 8, 7, cYellow);
+            tft.fillCircle(cx - 10, cy - 2, 9, cYellow);
+            tft.fillCircle(cx - 3, cy + 5, 11, cYellow);
+            tft.fillCircle(cx + 5, cy + 8, 12, cYellow);
+            tft.fillCircle(cx + 14, cy + 6, 11, cYellow);
+            tft.fillCircle(cx + 21, cy, 9, cYellow);
+            tft.fillCircle(cx + 26, cy - 7, 7, cYellow);
+
+            // Smooth inner curve cutout using card background
+            tft.fillCircle(cx + 5, cy - 14, 18, tft.color565(25, 38, 65));
+            tft.fillCircle(cx + 4, cy + 8, 11, cYellow); // restore belly roundness
+
+            // Stem at top-left tip
+            tft.fillRoundRect(cx - 24, cy - 15, 9, 6, 2, cStem);
+            // Tip at upper-right
+            tft.fillCircle(cx + 27, cy - 8, 3, cTip);
+
+            // Shading & peel ridge lines along the curve
+            tft.drawLine(cx - 12, cy + 4, cx + 4, cy + 14, cDarkYellow);
+            tft.drawLine(cx + 4, cy + 14, cx + 22, cy + 5, cDarkYellow);
+            tft.drawLine(cx - 8, cy - 1, cx + 5, cy + 6, cDarkYellow);
+        } else if (item == "snake") {
+            uint16_t cSnakeGreen = tft.color565(40, 180, 80);
+            uint16_t cSnakeLight = tft.color565(110, 225, 130);
+            uint16_t cTongue = tft.color565(240, 50, 70);
+            // Coiled body S-curve
+            tft.fillRoundRect(cx - 18, cy + 4, 38, 14, 7, cSnakeGreen);
+            tft.fillCircle(cx - 10, cy + 8, 10, cSnakeGreen);
+            tft.fillCircle(cx + 10, cy + 4, 11, cSnakeGreen);
+            tft.fillRoundRect(cx - 22, cy - 8, 22, 14, 7, cSnakeGreen);
+            // Head on upper right
+            tft.fillCircle(cx + 12, cy - 10, 13, cSnakeGreen);
+            tft.fillCircle(cx + 14, cy - 10, 8, cSnakeLight);
+            // Forked red tongue
+            tft.drawFastHLine(cx + 24, cy - 8, 8, cTongue);
+            tft.drawPixel(cx + 31, cy - 10, cTongue);
+            tft.drawPixel(cx + 31, cy - 6, cTongue);
+            // Cute eyes
+            tft.fillCircle(cx + 10, cy - 14, 3, TFT_BLACK);
+            tft.fillCircle(cx + 11, cy - 15, 1, TFT_WHITE);
+            tft.fillCircle(cx + 18, cy - 14, 3, TFT_BLACK);
+            tft.fillCircle(cx + 19, cy - 15, 1, TFT_WHITE);
+            // Belly pattern dots
+            tft.fillCircle(cx - 8, cy + 8, 3, cSnakeLight);
+            tft.fillCircle(cx + 6, cy + 6, 3, cSnakeLight);
+        } else if (item == "worm") {
+            uint16_t cWormPink = tft.color565(255, 135, 155);
+            uint16_t cWormDark = tft.color565(225, 95, 120);
+            // Wavy segmented body (series of overlapping soft round segments)
+            tft.fillCircle(cx - 22, cy + 12, 6, cWormPink); // tail
+            tft.fillCircle(cx - 14, cy + 4, 7, cWormPink);
+            tft.fillCircle(cx - 6, cy + 10, 8, cWormPink);
+            tft.fillCircle(cx + 4, cy + 2, 9, cWormPink);
+            tft.fillCircle(cx + 12, cy - 8, 10, cWormPink);
+            // Head
+            tft.fillCircle(cx + 16, cy - 15, 12, cWormPink);
+            // Segment ridges
+            tft.drawCircle(cx - 6, cy + 10, 8, cWormDark);
+            tft.drawCircle(cx + 4, cy + 2, 9, cWormDark);
+            // Rosy cheeks
+            tft.fillCircle(cx + 10, cy - 10, 3, tft.color565(255, 175, 190));
+            tft.fillCircle(cx + 22, cy - 10, 3, tft.color565(255, 175, 190));
+            // Cute eyes
+            tft.fillCircle(cx + 12, cy - 17, 2, TFT_BLACK);
+            tft.fillCircle(cx + 20, cy - 17, 2, TFT_BLACK);
+            // Smile
+            tft.drawPixel(cx + 15, cy - 12, cWormDark);
+            tft.drawPixel(cx + 16, cy - 11, cWormDark);
+            tft.drawPixel(cx + 17, cy - 12, cWormDark);
         } else {
             // Mystery card / Unknown
             tft.fillRoundRect(cx - 24, cy - 24, 48, 48, 8, tft.color565(60, 85, 125));
@@ -2223,6 +2391,10 @@ public:
             tft.drawBitmap(x, y, MM_BITMAP_dog, MM_BITMAP_dog_W, MM_BITMAP_dog_H, color, bg);
         } else if (item == "banana") {
             tft.drawBitmap(x, y, MM_BITMAP_banana, MM_BITMAP_banana_W, MM_BITMAP_banana_H, color, bg);
+        } else if (item == "snake") {
+            tft.drawBitmap(x, y, MM_BITMAP_snake, MM_BITMAP_snake_W, MM_BITMAP_snake_H, color, bg);
+        } else if (item == "worm") {
+            tft.drawBitmap(x, y, MM_BITMAP_worm, MM_BITMAP_worm_W, MM_BITMAP_worm_H, color, bg);
         }
     }
 
@@ -2257,7 +2429,13 @@ public:
         const uint16_t COLOR_BG = tft.color565(14, 40, 78);
         tft.fillRect(110, 165, 100, 36, COLOR_BG);
 
-        if (state == RobotState::SPEAKING) {
+        const auto prompt = wakePrompt.load(std::memory_order_relaxed);
+        if (state == RobotState::IDLE && prompt != WakePrompt::None) {
+            tft.setTextSize(1);
+            tft.setTextDatum(textdatum_t::middle_center);
+            tft.setTextColor(TFT_WHITE, COLOR_BG);
+            tft.drawString(prompt == WakePrompt::Speak ? "Speak now" : "Server offline", 160, 183);
+        } else if (state == RobotState::SPEAKING) {
             int h = 8 + (int)(abs(sin(now / 90.0f)) * 24);
             int w = 48 + (int)(abs(cos(now / 140.0f)) * 16);
             tft.fillRoundRect(160 - (w / 2), 183 - (h / 2), w, h, 6, tft.color565(0, 229, 255));
@@ -2463,6 +2641,17 @@ public:
             tft.fillRect(0, 24, 320, 216, tft.color565(14, 22, 38));
             tft.fillRoundRect(10, 28, 300, 206, 12, cCardBg);
             tft.drawRoundRect(10, 28, 300, 206, 12, tft.color565(70, 120, 190));
+
+            if (rfidCardView.lookup != RfidLookupState::Ready) {
+                tft.setTextDatum(textdatum_t::top_center);
+                tft.setTextSize(2);
+                tft.setTextColor(TFT_WHITE, cCardBg);
+                tft.drawString(rfidCardView.lookup == RfidLookupState::Pending ?
+                               "Reading card..." : "Card lookup unavailable", 160, 78);
+                tft.setTextSize(1);
+                tft.drawString(rfidCardView.uid.c_str(), 160, 119);
+                return;
+            }
 
             if (rfidCardView.found) {
                 // Header Banner
@@ -2678,6 +2867,26 @@ public:
     void update(RobotState state, bool wifiOk, int rssi, bool wsOk, uint8_t vol) {
         unsigned long now = millis();
 
+        RfidDisplayResult result{};
+        if (rfidDisplayQueue && xQueueReceive(rfidDisplayQueue, &result, 0) == pdTRUE) {
+            rememberRfidResult(result);
+            if (rfidCardView.active && rfidCardView.uid == result.uid &&
+                static_cast<int32_t>(result.receivedAt - rfidCardView.scannedAt) >= 0) {
+                if (rfidCardView.lookup != RfidLookupState::Ready || rfidCardView.found != result.found ||
+                    rfidCardView.itemKey != result.itemKey || rfidCardView.nameEn != result.nameEn) {
+                    applyRfidResult(result, now);
+                }
+                Serial.printf("[RFID] Result uid=%s scan-to-reply=%lu ms\n",
+                              result.uid, result.receivedAt - rfidCardView.scannedAt);
+            }
+        }
+        if (rfidCardView.active && rfidCardView.lookup == RfidLookupState::Pending &&
+            now - rfidCardView.displayStartTime >= 4000) {
+            rfidCardView.lookup = RfidLookupState::Unavailable;
+            rfidCardView.displayStartTime = now;
+            forceRedraw = true;
+        }
+
         // Auto-return from RFID learning card to robot face after 6 seconds
         if (currentScreen == ActiveScreen::SCREEN_RFID && rfidCardView.active) {
             if (now - rfidCardView.displayStartTime >= 6000) {
@@ -2703,7 +2912,14 @@ public:
                 case ActiveScreen::SCREEN_WIFI:        renderScreenWifi(wifiOk, WiFiManagerDriver::getInstance().getIpAddress(), rssi, ConfigManager::getInstance().getWifiSSID()); break;
                 case ActiveScreen::SCREEN_INFO:        renderScreenInfo(); break;
                 case ActiveScreen::SCREEN_DIAGNOSTICS: renderScreenDiagnostics(); break;
-                case ActiveScreen::SCREEN_RFID:        renderScreenRfid(); break;
+                case ActiveScreen::SCREEN_RFID:
+                    renderScreenRfid();
+                    if (rfidCardView.logDraw) {
+                        Serial.printf("[RFID] Drawn uid=%s scan-to-display=%lu ms\n",
+                                      rfidCardView.uid.c_str(), millis() - rfidCardView.scannedAt);
+                        rfidCardView.logDraw = false;
+                    }
+                    break;
                 default: break;
             }
         }
@@ -2722,9 +2938,7 @@ private:
     bool nfcReady = false;
 
     // TTP223 Head touch state
-    unsigned long headTouchStartTime = 0;
     bool headTouched = false;
-    bool headLongPressTriggered = false;
 
     // Physical volume buttons
     int lastBtnVolUp = HIGH;
@@ -2773,20 +2987,12 @@ public:
         int touchReading = digitalRead(PIN_TOUCH_SENSOR);
         if (touchReading == HIGH && !headTouched) {
             headTouched = true;
-            headTouchStartTime = now;
-            headLongPressTriggered = false;
             postEvent(EventType::TOUCH_SENSOR_PRESS);
             Serial.println("[Sensors] Head touch pressed.");
         } else if (touchReading == LOW && headTouched) {
             headTouched = false;
             postEvent(EventType::TOUCH_SENSOR_RELEASE);
             Serial.println("[Sensors] Head touch released.");
-        } else if (touchReading == HIGH && headTouched && !headLongPressTriggered) {
-            if (now - headTouchStartTime > 3000) { // 3-second long press
-                headLongPressTriggered = true;
-                postEvent(EventType::TOUCH_SENSOR_LONG_PRESS);
-                Serial.println("[Sensors] Head touch long-press detected -> Provisioning Portal requested.");
-            }
         }
 
         // 2. Physical Volume Buttons
@@ -2816,8 +3022,8 @@ public:
         }
 
         // 3. PN532 RFID Polling (Supports 4, 7, and 10-byte UIDs without buffer overflow)
-        static unsigned long lastCardTriggerTime = 0;
-        if (nfcReady && (now - lastRfidScanTime > 300)) {
+        static uint8_t missedRfidPolls = 0;
+        if (nfcReady && (now - lastRfidScanTime >= 100)) {
             lastRfidScanTime = now;
             uint8_t uid[12];
             uint8_t uidLength = 0;
@@ -2827,18 +3033,14 @@ public:
                     sprintf(hexStr + (i * 2), "%02X", uid[i]);
                 }
                 String cardUid = String(hexStr);
-                // Debounce same card: trigger if different UID or 2.5s elapsed
-                if (cardUid != lastScannedUid || (now - lastCardTriggerTime > 2500)) {
+                missedRfidPolls = 0;
+                if (cardUid != lastScannedUid) {
                     lastScannedUid = cardUid;
-                    lastCardTriggerTime = now;
-                    UIManager::getInstance().setLastRfid(cardUid);
-                    postEvent(EventType::RFID_CARD_DETECTED, 0, cardUid.c_str());
+                    postEvent(EventType::RFID_CARD_DETECTED, static_cast<int>(millis()), cardUid.c_str());
                     Serial.printf("[Sensors] RFID Scanned UID (%d bytes): %s\n", uidLength, cardUid.c_str());
                 }
-            } else {
-                if (now - lastCardTriggerTime > 1500) {
-                    lastScannedUid = "";
-                }
+            } else if (missedRfidPolls < 2 && ++missedRfidPolls == 2) {
+                lastScannedUid = "";
             }
         }
     }
@@ -2852,9 +3054,12 @@ SensorsDriver sensors;
 class WebSocketClientManager {
 private:
     uint32_t currentSessionGeneration = 0;
+    String requestedVoiceId;
+    String receivingAudioId;
+    bool receivingAdpcm = false;
     uint8_t leftoverByte = 0;
     bool hasLeftoverByte = false;
-    WebsocketsClient client;
+    std::unique_ptr<WebsocketsClient> client{new WebsocketsClient()};
     bool wsConnected = false;
     bool authenticated = false;
     unsigned long lastReconnect = 0;
@@ -2882,8 +3087,48 @@ public:
         leftoverByte = 0;
     }
 
+    void handleAdpcmFrame(const uint8_t* raw, size_t length) {
+        // Four-byte predictor/index/padding header, then one nibble per 24 kHz sample.
+        if (length <= 4 || length > 2884 || raw[2] > 88 || raw[3] > 1) return;
+        static constexpr int16_t steps[] = {
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+            34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+            157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+            724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024,
+            3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487,
+            12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+        };
+        static constexpr int8_t indexDelta[] = {-1, -1, -1, -1, 2, 4, 6, 8};
+        int predictor = static_cast<int16_t>(raw[0] | (raw[1] << 8));
+        int index = raw[2];
+        const size_t count = (length - 4) * 2 - raw[3];
+        int16_t samples[512];
+        size_t buffered = 0;
+        auto& output = AudioOutputDriver::getInstance();
+        for (size_t i = 0; i < count; ++i) {
+            const uint8_t code = (raw[4 + (i >> 1)] >> ((i & 1) * 4)) & 15;
+            const int step = steps[index];
+            int change = step >> 3;
+            if (code & 4) change += step;
+            if (code & 2) change += step >> 1;
+            if (code & 1) change += step >> 2;
+            predictor = std::clamp(predictor + ((code & 8) ? -change : change), -32768, 32767);
+            index = std::clamp(index + indexDelta[code & 7], 0, 88);
+            samples[buffered++] = static_cast<int16_t>(predictor);
+            if (buffered == 512) {
+                if (!output.enqueuePcm(samples, buffered, currentSessionGeneration)) return;
+                buffered = 0;
+            }
+        }
+        if (buffered) output.enqueuePcm(samples, buffered, currentSessionGeneration);
+    }
+
     void handleBinaryMessage(const uint8_t* raw, size_t rawLen) {
-        if (!raw || rawLen == 0) return;
+        if (!raw || rawLen == 0 || !currentSessionGeneration) return;
+        if (receivingAdpcm) {
+            handleAdpcmFrame(raw, rawLen);
+            return;
+        }
 
         size_t readOffset = 0;
 
@@ -2898,23 +3143,11 @@ public:
             AudioOutputDriver::getInstance().enqueuePcm(&sample, 1, currentSessionGeneration);
         }
 
-        // Process remaining bytes in chunks of up to 256 samples (512 bytes)
-        int16_t chunkBuffer[256];
-        size_t remainingBytes = rawLen - readOffset;
-        size_t fullSamples = remainingBytes / sizeof(int16_t);
-
-        while (fullSamples > 0) {
-            size_t batchSamples = (fullSamples > 256) ? 256 : fullSamples;
-            size_t bytesToCopy = batchSamples * sizeof(int16_t);
-
-            memcpy(chunkBuffer, &raw[readOffset], bytesToCopy);
-            readOffset += bytesToCopy;
-            fullSamples -= batchSamples;
-
-            bool ok = AudioOutputDriver::getInstance().enqueuePcm(chunkBuffer, batchSamples, currentSessionGeneration);
-            if (!ok) {
-                // Frame rejected due to generation mismatch, session cancel, or ring buffer full
-            }
+        // The ring buffer copies bytes, so audio frames do not need a temporary aligned buffer.
+        const size_t fullSamples = (rawLen - readOffset) / sizeof(int16_t);
+        if (fullSamples) {
+            AudioOutputDriver::getInstance().enqueuePcm(raw + readOffset, fullSamples, currentSessionGeneration);
+            readOffset += fullSamples * sizeof(int16_t);
         }
 
         // Save leftover byte if frame has odd length
@@ -2955,46 +3188,52 @@ public:
                       DEFAULT_WS_HOST, DEFAULT_WS_PORT, DEFAULT_WS_PATH);
 
 #ifndef WS_PROBE
-#define WS_PROBE 1
+#define WS_PROBE 0
 #endif
 #if WS_PROBE
         static bool probed = false;
         if (!probed) { probed = true; probeUpgrade(devId, apiKey); }
 #endif
 
-        resetAssembler(); // Clear any stale incomplete sample
-        client = WebsocketsClient();
-        // Keep certificate and hostname verification enabled. Never use setInsecure().
-        client.setCACert(PROD_ROOT_CA_BUNDLE);
-        client.addHeader("X-Device-ID", devId);
-        client.addHeader("X-Device-Key", apiKey);
-
-        client.onMessage([this](WebsocketsMessage msg) {
-            if (msg.isBinary()) {
-                handleBinaryMessage((const uint8_t*)msg.c_str(), msg.length());
-            } else if (msg.isText()) {
-                handleTextMessage(msg.data());
-            }
-        });
-
-        client.onEvent([this](WebsocketsEvent event, String data) {
-            if (event == WebsocketsEvent::ConnectionOpened) {
-                wsConnected = true;
-                wsConnectedAt = millis();
-                Serial.println("[WebSocket] TLS connection opened. Waiting for backend device:connected authentication...");
-            } else if (event == WebsocketsEvent::ConnectionClosed) {
-                resetAssembler(); // Clear assembler on disconnect
-                wsConnected = false;
-                authenticated = false;
-                wsConnectedAt = 0;
-                postEvent(EventType::WS_DISCONNECTED);
-                Serial.printf("[WebSocket] Connection closed. Reason: %s (code: %d)\n", data.c_str(), (int)client.getCloseReason());
-            }
-        });
-
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(500))) {
+            resetAssembler(); // Clear any stale incomplete sample
+            client.reset(new WebsocketsClient());
+            // Keep certificate and hostname verification enabled. Never use setInsecure().
+            client->setCACert(PROD_ROOT_CA_BUNDLE);
+            client->addHeader("X-Device-ID", devId);
+            client->addHeader("X-Device-Key", apiKey);
+            if (AudioOutputDriver::getInstance().hasPsramAudioBuffer()) {
+                client->addHeader("X-Audio-Codec", "ima-adpcm");
+            }
+
+            client->onMessage([this](WebsocketsMessage msg) {
+                if (msg.isBinary()) {
+                    handleBinaryMessage((const uint8_t*)msg.c_str(), msg.length());
+                } else if (msg.isText()) {
+                    handleTextMessage(msg.data());
+                }
+            });
+
+            client->onEvent([this](WebsocketsEvent event, String data) {
+                if (event == WebsocketsEvent::ConnectionOpened) {
+                    wsConnected = true;
+                    wsConnectedAt = millis();
+                    Serial.println("[WebSocket] TLS connection opened. Waiting for backend device:connected authentication...");
+                } else if (event == WebsocketsEvent::ConnectionClosed) {
+                    resetAssembler(); // Clear assembler on disconnect
+                    requestedVoiceId = "";
+                    receivingAudioId = "";
+                    currentSessionGeneration = 0;
+                    wsConnected = false;
+                    authenticated = false;
+                    wsConnectedAt = 0;
+                    postEvent(EventType::WS_DISCONNECTED);
+                    Serial.printf("[WebSocket] Connection closed. Reason: %s (code: %d)\n", data.c_str(), (int)client->getCloseReason());
+                }
+            });
+
             const uint32_t t0 = millis();
-            bool ok = client.connectSecure(DEFAULT_WS_HOST, DEFAULT_WS_PORT, DEFAULT_WS_PATH);
+            bool ok = client->connectSecure(DEFAULT_WS_HOST, DEFAULT_WS_PORT, DEFAULT_WS_PATH);
             const uint32_t dt = millis() - t0;
             xSemaphoreGive(wsMutex);
             if (!ok) {
@@ -3078,18 +3317,36 @@ public:
             resetAssembler(); // Clear odd-byte assembler on new session boundary
             uint32_t sRate = data["sampleRate"] | 24000;
             const char* sessId = data["sessionId"] | "";
+            if (strncmp(sessId, "voice_", 6) == 0 && requestedVoiceId != sessId) {
+                Serial.println("[WebSocket] Ignored stale voice response.");
+                currentSessionGeneration = 0;
+                receivingAudioId = "";
+                return;
+            }
+            receivingAudioId = sessId;
+            receivingAdpcm = strcmp(data["wireCodec"] | "", "ima-adpcm") == 0;
+            Serial.printf("[AudioOutput] Wire codec: %s\n", receivingAdpcm ? "ima-adpcm" : "pcm");
             const char* srcType = data["source"] | data["type"] | "";
             bool isMp3 = (strcmp(srcType, "mp3") == 0 || (sessId && strstr(sessId, "mp3") != nullptr));
-            currentSessionGeneration = AudioOutputDriver::getInstance().startSession(sessId, sRate, isMp3);
-            postEvent(EventType::VOICE_RESPONSE_START, (int)sRate);
+            const uint16_t initialBufferMs = (receivingAdpcm && strcmp(srcType, "quick_reply") == 0) ? 480 : 0;
+            currentSessionGeneration = AudioOutputDriver::getInstance().startSession(sessId, sRate, isMp3, initialBufferMs);
+            postEvent(EventType::VOICE_RESPONSE_START, (int)sRate, sessId);
             Serial.printf("[WebSocket] AI Voice response starting: %s (gen: %lu, %lu Hz, mp3=%d)\n",
                           sessId[0] ? sessId : "<none>", (unsigned long)currentSessionGeneration, (unsigned long)sRate, (int)isMp3);
         } else if (strcmp(ev, "audio:response:end") == 0) {
+            const char* sessId = data["sessionId"] | "";
+            if (!currentSessionGeneration || (*sessId && receivingAudioId != sessId)) return;
+            currentSessionGeneration = 0;
+            // Keep the speaker session ID until the next start or cancel so Stop also works during drain.
             resetAssembler(); // Clear odd-byte assembler on session end
             AudioOutputDriver::getInstance().endSession();
             postEvent(EventType::VOICE_RESPONSE_END);
             Serial.println("[WebSocket] AI Voice response finished.");
         } else if (strcmp(ev, "audio:cancel") == 0) {
+            const char* stopId = data["sessionId"] | "";
+            if (*stopId && (receivingAudioId != stopId ||
+                (!currentSessionGeneration && !AudioOutputDriver::getInstance().hasBufferedAudio()))) return;
+            receivingAudioId = "";
             resetAssembler(); // Clear odd-byte assembler on session cancel
             const char* reason = data["reason"] | "interrupted";
             AudioOutputDriver::getInstance().cancelSession(reason);
@@ -3103,7 +3360,13 @@ public:
             const char* nameMm = data["nameMm"] | "";
             Serial.printf("[WebSocket] RFID Result: uid=%s, found=%d, item=%s, en=%s, mm=%s\n",
                           cardUid, (int)found, itemKey, nameEn, nameMm);
-            UIManager::getInstance().showRfidResult(cardUid, found, itemKey, nameEn, nameMm);
+            RfidDisplayResult result{};
+            snprintf(result.uid, sizeof(result.uid), "%s", cardUid);
+            snprintf(result.itemKey, sizeof(result.itemKey), "%s", itemKey);
+            snprintf(result.nameEn, sizeof(result.nameEn), "%s", nameEn);
+            result.found = found;
+            result.receivedAt = millis();
+            if (rfidDisplayQueue) xQueueOverwrite(rfidDisplayQueue, &result);
         } else if (strcmp(ev, "robot:command") == 0) {
             const char* cmd = data["type"] | "";
             if (strcmp(cmd, "set_volume") == 0) {
@@ -3128,7 +3391,7 @@ public:
         String out;
         serializeJson(doc, out);
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
-            bool ok = (client.available() && authenticated) ? client.send(out) : false;
+            bool ok = (client->available() && authenticated) ? client->send(out) : false;
             xSemaphoreGive(wsMutex);
             Serial.printf("[WebSocket] Handshake ACK: Sent audio:ready for session %s (gen: %lu)\n",
                           sessId ? sessId : "<none>", (unsigned long)gen);
@@ -3149,7 +3412,7 @@ public:
         String out;
         serializeJson(doc, out);
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
-            bool ok = (client.available() && authenticated) ? client.send(out) : false;
+            bool ok = (client->available() && authenticated) ? client->send(out) : false;
             xSemaphoreGive(wsMutex);
             if (ok) {
                 Serial.printf("[WebSocket] Watermark Flow Control: Sent audio:flow %s (gen: %lu, free: %u B)\n",
@@ -3162,7 +3425,7 @@ public:
 
     void update() {
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(20))) {
-            if (wsConnected) client.poll();
+            if (wsConnected) client->poll(4);
             xSemaphoreGive(wsMutex);
         }
 
@@ -3192,7 +3455,7 @@ public:
         if (wsConnected && !authenticated && wsConnectedAt != 0 && now - wsConnectedAt > 20000) {
             Serial.println("[WebSocket] No device:connected acknowledgement after 20 seconds; closing and retrying.");
             if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100))) {
-                client.close();
+                client->close();
                 xSemaphoreGive(wsMutex);
             }
             wsConnected = false;
@@ -3202,7 +3465,7 @@ public:
         if (!wsConnected && WiFiManagerDriver::getInstance().isConnected()) {
             if (now - lastReconnect > reconnectInterval) {
                 lastReconnect = now;
-                reconnectInterval = (reconnectInterval * 2 <= 30000) ? (reconnectInterval * 2) : 30000;
+                reconnectInterval = std::min<unsigned long>(reconnectInterval * 2, 8000);
                 connect();
             }
         }
@@ -3226,7 +3489,7 @@ public:
         String out;
         serializeJson(doc, out);
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
-            if (client.available()) client.send(out);
+            if (client->available()) client->send(out);
             xSemaphoreGive(wsMutex);
         }
     }
@@ -3242,7 +3505,8 @@ public:
         String out;
         serializeJson(doc, out);
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
-            bool ok = client.available() ? client.send(out) : false;
+            bool ok = client->available() ? client->send(out) : false;
+            if (ok) requestedVoiceId = sessId;
             xSemaphoreGive(wsMutex);
             return ok;
         }
@@ -3252,7 +3516,7 @@ public:
     bool sendAudioChunk(const uint8_t* pcm, size_t len) {
         if (!pcm || len == 0) return false;
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100))) {
-            bool ok = (client.available() && authenticated) ? client.sendBinary((const char*)pcm, len) : false;
+            bool ok = (client->available() && authenticated) ? client->sendBinary((const char*)pcm, len) : false;
             xSemaphoreGive(wsMutex);
             return ok;
         }
@@ -3267,8 +3531,8 @@ public:
 
         String out;
         serializeJson(doc, out);
-        if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
-            bool ok = client.available() ? client.send(out) : false;
+        if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(250))) {
+            bool ok = client->available() ? client->send(out) : false;
             xSemaphoreGive(wsMutex);
             return ok;
         }
@@ -3285,7 +3549,7 @@ public:
         String out;
         serializeJson(doc, out);
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
-            bool ok = client.available() ? client.send(out) : false;
+            bool ok = client->available() ? client->send(out) : false;
             xSemaphoreGive(wsMutex);
             return ok;
         }
@@ -3301,7 +3565,7 @@ public:
         String out;
         serializeJson(doc, out);
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
-            bool ok = client.available() ? client.send(out) : false;
+            bool ok = client->available() ? client->send(out) : false;
             xSemaphoreGive(wsMutex);
             return ok;
         }
@@ -3317,7 +3581,8 @@ public:
         String out;
         serializeJson(doc, out);
         if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50))) {
-            bool ok = client.available() ? client.send(out) : false;
+            requestedVoiceId = "";
+            bool ok = client->available() ? client->send(out) : false;
             xSemaphoreGive(wsMutex);
             Serial.printf("[WebSocket] Sent audio:cancel (reason: %s)\n", reason ? reason : "user_cancel");
             return ok;
@@ -3333,6 +3598,8 @@ class DeviceManager {
 private:
     volatile RobotState currentState = RobotState::IDLE;
     bool waitingForPlaybackDrain = false;
+    bool voiceReply = false;
+    std::atomic<unsigned long> followupStarted{0};
     unsigned long drainCompleteTime = 0;
     String currentSessionId = "";
     volatile uint32_t audioChunkCount = 0;
@@ -3343,6 +3610,11 @@ public:
     static DeviceManager& getInstance() {
         static DeviceManager instance;
         return instance;
+    }
+
+    bool followupOpen() const {
+        const unsigned long start = followupStarted.load();
+        return start && millis() - start < 8000;
     }
 
     RobotState getState() const { return currentState; }
@@ -3386,10 +3658,11 @@ public:
     }
 
     // Accepts call from IDLE or conversational SPEAKING state
-    void startVoiceSession() {
+    void startVoiceSession(bool followup = false) {
         if (currentState != RobotState::IDLE && currentState != RobotState::SPEAKING && currentState != RobotState::THINKING) return;
         if (!WebSocketClientManager::getInstance().isAuthenticated()) {
             Serial.println("[DeviceManager] Cannot start voice: WebSocket not authenticated.");
+            if (currentState == RobotState::IDLE) WakeWordEngine::getInstance().setListening(true);
             return;
         }
 
@@ -3399,8 +3672,10 @@ public:
             waitingForPlaybackDrain = false;
         }
 
+        followupStarted.store(0);
+        waitingForPlaybackDrain = false;
         String devId = ConfigManager::getInstance().getDeviceId();
-        currentSessionId = "voice_" + devId + "_" + String(millis());
+        if (!followup) currentSessionId = "voice_" + devId + "_" + String(millis());
         audioChunkCount = 0;
         listeningStartTime = millis();
 
@@ -3408,6 +3683,7 @@ public:
         bool started = WebSocketClientManager::getInstance().sendAudioStart(currentSessionId, AUDIO_IN_SAMPLE_RATE);
         if (!started) {
             Serial.println("[DeviceManager] Failed to send audio:start to server! Aborting voice session.");
+            if (currentState == RobotState::IDLE) WakeWordEngine::getInstance().setListening(true);
             return;
         }
 
@@ -3422,12 +3698,17 @@ public:
         AudioInputDriver::getInstance().stopRecording();
         if (audioChunkCount == 0) {
             // Clean up backend session cleanly even if no audio was captured
-            WebSocketClientManager::getInstance().sendAudioEnd(0);
+            WebSocketClientManager::getInstance().sendAudioCancel("empty_capture");
             setState(RobotState::IDLE);
             return;
         }
 
-        WebSocketClientManager::getInstance().sendAudioEnd(audioChunkCount);
+        if (!WebSocketClientManager::getInstance().isAuthenticated() ||
+            !WebSocketClientManager::getInstance().sendAudioEnd(audioChunkCount)) {
+            Serial.println("[DeviceManager] audio:end send failed.");
+            setState(RobotState::IDLE);
+            return;
+        }
         thinkingStartTime = millis();
         setState(RobotState::THINKING);
         Serial.printf("[DeviceManager] Audio capture ended (%lu chunks sent). Waiting for Gemini Live...\n", (unsigned long)audioChunkCount);
@@ -3456,12 +3737,6 @@ public:
                 WebSocketClientManager::getInstance().sendTouchEvent(0, false);
                 break;
 
-            case EventType::TOUCH_SENSOR_LONG_PRESS:
-                Serial.println("[DeviceManager] Head-touch 3s Long Press -> Starting Web Provisioning Portal!");
-                WiFiManagerDriver::getInstance().startProvisioningPortal();
-                UIManager::getInstance().setScreen(ActiveScreen::SCREEN_WIFI);
-                break;
-
             case EventType::PROV_PORTAL_START:
                 WiFiManagerDriver::getInstance().startProvisioningPortal();
                 UIManager::getInstance().setScreen(ActiveScreen::SCREEN_WIFI);
@@ -3472,14 +3747,20 @@ public:
                 break;
 
             case EventType::VOICE_SESSION_START:
-                startVoiceSession();
+                if (ev.intValue == 0 || followupOpen()) startVoiceSession(ev.intValue == 1);
                 break;
 
             case EventType::VOICE_SESSION_END:
-                endVoiceSession();
+                if (!ev.intValue || static_cast<unsigned long>(ev.intValue) == listeningStartTime) endVoiceSession();
                 break;
 
             case EventType::VOICE_RESPONSE_START:
+                followupStarted.store(0);
+                waitingForPlaybackDrain = false;
+                voiceReply = currentSessionId == ev.text;
+                if (voiceReply && currentState == RobotState::THINKING) {
+                    Serial.printf("[VoiceLatency] End-to-response-start: %lu ms\n", millis() - thinkingStartTime);
+                }
                 setState(RobotState::SPEAKING);
                 break;
 
@@ -3491,8 +3772,9 @@ public:
                 break;
 
             case EventType::VOICE_AUDIO_CANCEL:
-                AudioOutputDriver::getInstance().stopAndFlush();
-                setState(RobotState::LISTENING);
+                voiceReply = false;
+                waitingForPlaybackDrain = false;
+                if (!AudioInputDriver::getInstance().isRecording()) setState(RobotState::IDLE);
                 break;
 
             case EventType::WS_AUTHENTICATED:
@@ -3500,13 +3782,23 @@ public:
                 break;
 
             case EventType::WS_DISCONNECTED:
+                AudioOutputDriver::getInstance().stopAndFlush();
+                followupStarted.store(0);
+                waitingForPlaybackDrain = false;
+                voiceReply = false;
+                AudioInputDriver::getInstance().stopRecording();
                 setState(RobotState::IDLE);
                 break;
 
-            case EventType::RFID_CARD_DETECTED:
+            case EventType::RFID_CARD_DETECTED: {
                 AudioOutputDriver::getInstance().triggerCuteChime();
-                WebSocketClientManager::getInstance().sendRfidScan(String(ev.text));
+                auto& cloud = WebSocketClientManager::getInstance();
+                const auto scannedAt = static_cast<unsigned long>(ev.intValue);
+                const bool lookupQueued = rfidLookupQueue && cloud.isAuthenticated();
+                UIManager::getInstance().showRfidScan(ev.text, scannedAt, lookupQueued);
+                if (lookupQueued) xQueueOverwrite(rfidLookupQueue, &ev);
                 break;
+            }
 
             case EventType::BUTTON_VOL_UP:
             case EventType::BUTTON_VOL_DOWN:
@@ -3529,10 +3821,12 @@ public:
             if (!AudioOutputDriver::getInstance().hasBufferedAudio()) {
                 if (drainCompleteTime == 0) {
                     drainCompleteTime = millis();
-                } else if (millis() - drainCompleteTime >= 400) {
+                } else if (millis() - drainCompleteTime >= 100) {
                     waitingForPlaybackDrain = false;
                     drainCompleteTime = 0;
                     setState(RobotState::IDLE);
+                    if (voiceReply) followupStarted.store(millis());
+                    voiceReply = false;
                     Serial.println("[DeviceManager] Speaker buffer completely drained. System is now IDLE.");
                 }
             } else {
@@ -3546,7 +3840,7 @@ public:
             if (millis() - thinkingStartTime > 15000) {
                 Serial.println("[DeviceManager] Response timeout. Returning to IDLE.");
                 setState(RobotState::IDLE);
-                WakeWordEngine::getInstance().setListening(true);
+                WebSocketClientManager::getInstance().sendAudioCancel("response_timeout");
             }
         }
     }
@@ -3565,7 +3859,15 @@ void taskNetwork(void* parameter) {
     for (;;) {
         WiFiManagerDriver::getInstance().update();
         if (WiFiManagerDriver::getInstance().isConnected() && !WiFiManagerDriver::getInstance().isPortalActive()) {
-            WebSocketClientManager::getInstance().update();
+            auto& cloud = WebSocketClientManager::getInstance();
+            AppEvent lookup{};
+            if (cloud.isAuthenticated() && rfidLookupQueue &&
+                xQueueReceive(rfidLookupQueue, &lookup, 0) == pdTRUE) {
+                const bool sent = cloud.sendRfidScan(String(lookup.text));
+                Serial.printf("[RFID] Lookup uid=%s sent=%d scan-to-send=%lu ms\n",
+                              lookup.text, (int)sent, millis() - static_cast<unsigned long>(lookup.intValue));
+            }
+            cloud.update();
         }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -3606,7 +3908,44 @@ void taskAudioCapture(void* parameter) {
 
         RobotState curState = DeviceManager::getInstance().getState();
 
+        static uint32_t ambient = 120;
+        static bool awaitingOnset = false;
+        static unsigned long wakeAt = 0;
+        static unsigned long offlinePromptAt = 0;
+        static unsigned onsetFrames = 0;
+        static unsigned voicedFrames = 0;
+        static unsigned long lastSpeech = 0, lastStart = 0;
+        static bool endQueued = false;
+        static bool speechSeen = false;
+        int32_t sampleSum = 0;
+        for (size_t i = 0; i < readSamples; ++i) sampleSum += pcmBuffer[i];
+        const int32_t mean = sampleSum / static_cast<int32_t>(readSamples);
+        uint32_t sum = 0;
+        for (size_t i = 0; i < readSamples; ++i) sum += abs(pcmBuffer[i] - mean);
+        const uint32_t level = sum / readSamples;
+        const bool speech = level > std::max<uint32_t>(100, ambient * 2);
+        const bool cloudReady = WebSocketClientManager::getInstance().isAuthenticated();
+        if (curState != RobotState::IDLE || (!cloudReady && awaitingOnset)) {
+            if (awaitingOnset && curState == RobotState::IDLE) WakeWordEngine::getInstance().setListening(true);
+            awaitingOnset = false;
+            wakePrompt.store(WakePrompt::None, std::memory_order_relaxed);
+        } else if (wakePrompt.load(std::memory_order_relaxed) == WakePrompt::Offline &&
+                   millis() - offlinePromptAt >= 3000) {
+            wakePrompt.store(WakePrompt::None, std::memory_order_relaxed);
+        }
+        if (curState == RobotState::IDLE && !awaitingOnset && !DeviceManager::getInstance().followupOpen())
+            ambient = (31 * ambient + std::min(level, ambient * 2 + 32)) / 32;
+        if (curState != RobotState::IDLE || !DeviceManager::getInstance().followupOpen()) voicedFrames = 0;
+
         if (curState == RobotState::LISTENING && AudioInputDriver::getInstance().isRecording()) {
+            const unsigned long started = DeviceManager::getInstance().getListeningStartTime();
+            if (lastStart != started) {
+                lastStart = started;
+                lastSpeech = started;
+                endQueued = false;
+                speechSeen = WakeWordEngine::getInstance().hasPreRoll();
+            }
+            if (endQueued) continue;
             // 1. ACTIVE CONVERSATION:
             // Flush pre-roll buffer if session was just activated via Wake Word detection
             if (WakeWordEngine::getInstance().hasPreRoll()) {
@@ -3624,17 +3963,61 @@ void taskAudioCapture(void* parameter) {
                 DeviceManager::getInstance().incrementAudioChunkCount();
             }
 
-            // Utterance timeout (4.0s auto-stop if not tapped to end)
-            if (millis() - DeviceManager::getInstance().getListeningStartTime() > 4000) {
-                Serial.println("[DeviceManager] Voice capture auto-complete (4.0s utterance reached). Posting end event.");
-                postEvent(EventType::VOICE_SESSION_END);
+            if (speech) {
+                speechSeen = true;
+                lastSpeech = millis();
+            }
+            if (millis() - lastSpeech >= (speechSeen ? 1200UL : 3000UL)) {
+                Serial.println("[DeviceManager] Voice capture auto-complete. Posting end event.");
+                AppEvent endEvent{};
+                endEvent.type = EventType::VOICE_SESSION_END;
+                endEvent.intValue = static_cast<int>(started);
+                endQueued = xQueueSend(appEventQueue, &endEvent, 0) == pdTRUE;
             }
         } else if (curState == RobotState::IDLE) {
             // 2. STANDBY LOCAL WAKE-WORD DETECTION:
             // Zero microphone data is sent over the network during standby (privacy preserved).
             // Prevent speaker echo: pause WakeNet if speaker is actively playing audio!
             if (!AudioOutputDriver::getInstance().isPlaying()) {
-                WakeWordEngine::getInstance().processPcmChunk(pcmBuffer, readSamples);
+                auto& wake = WakeWordEngine::getInstance();
+                if (awaitingOnset) {
+                    wake.remember(pcmBuffer, readSamples);
+                    const unsigned long elapsed = millis() - wakeAt;
+                    if (speech && (elapsed < 3000 || onsetFrames > 0)) ++onsetFrames;
+                    else onsetFrames = 0;
+                    if (onsetFrames >= 2) {
+                        AppEvent start{};
+                        start.type = EventType::VOICE_SESSION_START;
+                        wake.preservePreRoll();
+                        awaitingOnset = false;
+                        wakePrompt.store(WakePrompt::None, std::memory_order_relaxed);
+                        if (xQueueSend(appEventQueue, &start, 0) != pdTRUE) wake.setListening(true);
+                    } else if (elapsed >= 3000 && onsetFrames == 0) {
+                        awaitingOnset = false;
+                        wakePrompt.store(WakePrompt::None, std::memory_order_relaxed);
+                        wake.setListening(true);
+                        Serial.println("[WakeWord] No speech within 3s; no cloud turn opened.");
+                    }
+                } else if (wake.processPcmChunk(pcmBuffer, readSamples)) {
+                    if (cloudReady) {
+                        wakeAt = millis();
+                        awaitingOnset = true;
+                        onsetFrames = 0;
+                        wakePrompt.store(WakePrompt::Speak, std::memory_order_relaxed);
+                        Serial.println("[WakeWord] Speak now (3s).");
+                    } else {
+                        offlinePromptAt = millis();
+                        wakePrompt.store(WakePrompt::Offline, std::memory_order_relaxed);
+                        wake.setListening(true);
+                        Serial.println("[WakeWord] Wake detected; server offline.");
+                    }
+                } else if (cloudReady && DeviceManager::getInstance().followupOpen()) {
+                    voicedFrames = speech ? voicedFrames + 1 : 0;
+                    if (voicedFrames == 2) {
+                        WakeWordEngine::getInstance().preservePreRoll();
+                        postEvent(EventType::VOICE_SESSION_START, 1);
+                    }
+                }
             }
         }
 
@@ -3646,7 +4029,15 @@ void taskAudioCapture(void* parameter) {
 // SECTION 15: SERIAL CLI PROVISIONING COMMANDS
 // ============================================================================
 void executeCliCommand(const String& cmd) {
-    if (cmd.startsWith("PROV:WIFI:")) {
+    if (cmd == "AUDIO:TEST") {
+        auto& speaker = AudioOutputDriver::getInstance();
+        if (speaker.hasBufferedAudio() || speaker.isSessionActive()) {
+            Serial.println("[CLI] Stop current audio before testing the speaker.");
+        } else {
+            Serial.println("[CLI] Playing a 3-second local speaker test.");
+            speaker.triggerCuteChime(true);
+        }
+    } else if (cmd.startsWith("PROV:WIFI:")) {
         int firstColon = cmd.indexOf(':', 10);
         if (firstColon > 0) {
             String ssid = cmd.substring(10, firstColon);
@@ -3727,7 +4118,7 @@ void setup() {
     // and native USB CDC when USB CDC On Boot is enabled.
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n[BOOT] Memo sketch setup() entered - serial path is working.");
+    Serial.println("\n[BOOT] Memo voice build 2026-11-23-r14");
 
     // Comprehensive ESP-IDF Reset Reason Diagnostics
     esp_reset_reason_t rst = esp_reset_reason();
@@ -3783,6 +4174,8 @@ void setup() {
 
     // 4. Initialize Event Queue & NVS
     appEventQueue = xQueueCreate(32, sizeof(AppEvent));
+    rfidDisplayQueue = xQueueCreate(1, sizeof(RfidDisplayResult));
+    rfidLookupQueue = xQueueCreate(1, sizeof(AppEvent));
     ConfigManager::getInstance().begin();
 
     // 5. Initialize Display & Touch Calibration
